@@ -1287,7 +1287,7 @@ class APITest(jtu.JaxTestCase):
     python_should_be_executing = False
     api.pmap(f, 'i')(x)
 
-  def test_repr(self):
+  def test_device_array_repr(self):
     rep = repr(np.ones(()) + 1.)
     self.assertStartsWith(rep, 'DeviceArray')
 
@@ -1325,6 +1325,41 @@ class APITest(jtu.JaxTestCase):
 
     self.assertAllClose(ans1, onp.cos(2.), check_dtypes=False)
     self.assertAllClose(ans2, onp.cos(3.), check_dtypes=False)
+
+  def test_lazy_reshape_multiply(self):
+    if not hasattr(self, "assertLogs"):
+      raise unittest.SkipTest("test requires assertLogs (python 3)")
+
+    a = np.array([1, 2, 3], dtype=onp.int32)
+
+    with self.assertLogs(level=logging.DEBUG) as l:
+      x = a[:, None] * a[None, :]
+
+    expected = onp.outer([1, 2, 3], [1, 2, 3])
+    self.assertAllClose(x, expected, check_dtypes=False)
+
+    self.assertLen(l.output, 1)
+    self.assertIn(
+        "parameter.1 = s32[3]{0} parameter(0)",
+        l.output[-1])
+
+  def test_lazy_iota_broadcast_add(self):
+    if not hasattr(self, "assertLogs"):
+      raise unittest.SkipTest("test requires assertLogs (python 3)")
+
+    lax.add(1, 2)  # make sure some initial warnings are already printed
+
+    with self.assertLogs(level=logging.DEBUG) as l:
+      a = np.arange(3, dtype=onp.int32)
+      y = np.broadcast_to(a, (5, 3))
+      z = y + 5
+    self.assertLen(l.output, 1)
+    self.assertIn(
+        "iota.1 = s32[3]{0} iota(), iota_dimension=0",
+        l.output[-1])
+
+    expected = onp.broadcast_to(onp.arange(3), (5, 3)) + 5
+    self.assertAllClose(z, expected, check_dtypes=False)
 
 
 if __name__ == '__main__':

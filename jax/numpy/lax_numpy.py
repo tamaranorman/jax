@@ -52,7 +52,7 @@ from ..abstract_arrays import UnshapedArray, ShapedArray, ConcreteArray
 from ..config import flags
 from ..interpreters.xla import DeviceArray
 from .. import lax
-from ..util import partial, get_module_functions, unzip2, prod as _prod
+from ..util import partial, get_module_functions, unzip2, subvals, prod as _prod
 from ..lib import pytree
 from ..lib import xla_client
 
@@ -1020,7 +1020,7 @@ def split(ary, indices_or_sections, axis=0):
   subarrays = onp.split(dummy_val, indices_or_sections, axis)  # shapes
   split_indices = onp.cumsum([0] + [onp.shape(sub)[axis] for sub in subarrays])
   starts, ends = [0] * ndim(ary), shape(ary)
-  _subval = lambda x, i, v: lax.subvals(x, [(i, v)])
+  _subval = lambda x, i, v: subvals(x, [(i, v)])
   return [lax.slice(ary, _subval(starts, axis, start), _subval(ends, axis, end))
           for start, end in zip(split_indices[:-1], split_indices[1:])]
 
@@ -1183,7 +1183,7 @@ def _make_reduction(np_fun, op, init_val, preproc=None, bool_op=None,
     result = lax.reduce(a, _reduction_init_val(a, init_val),
                         op if computation_dtype != bool_ else bool_op, dims)
     if keepdims:
-      shape_with_singletons = lax.subvals(shape(a), zip(dims, (1,) * len(dims)))
+      shape_with_singletons = subvals(shape(a), zip(dims, (1,) * len(dims)))
       result = lax.reshape(result, shape_with_singletons)
     return lax.convert_element_type(result, dtype or result_dtype)
 
@@ -1717,7 +1717,7 @@ def eye(N, M=None, k=None, dtype=None):
   lax._check_user_dtype_supported(dtype, "eye")
   dtype = float_ if dtype is None else dtype
   M = N if M is None else M
-  k =  int(k)
+  k = int(k or 0)
   if N < 0 or M < 0:
     msg = "negative dimensions are not allowed, got {} and {}"
     raise ValueError(msg.format(N, M))
@@ -1965,7 +1965,7 @@ def tri(N, M=None, k=0, dtype=None):
   lax._check_user_dtype_supported(dtype, "tri")
   M = M if M is not None else N
   dtype = dtype or float32
-  k = int(k)
+  k = int(k or 0)
   return lax.tri(dtype, (N, M), k)
 
 

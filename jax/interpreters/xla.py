@@ -25,7 +25,7 @@ import os
 from absl import logging
 import numpy as onp
 import six
-from six.moves import xrange
+from six.moves import xrange, reduce
 
 from ..config import flags
 from .. import core
@@ -37,7 +37,7 @@ from ..abstract_arrays import (ConcreteArray, ShapedArray, AbstractToken,
                                make_shaped_array, array_types, raise_to_shaped,
                                abstract_token, make_abstract_python_scalar)
 from ..core import valid_jaxtype, Literal
-from ..util import partial, partialmethod, cache, safe_map, prod, unzip2
+from ..util import partial, partialmethod, cache, safe_map, prod, unzip2, subvals
 from ..lib import xla_bridge as xb
 from ..lib import xla_client as xc
 from . import partial_eval as pe
@@ -62,6 +62,7 @@ LazyArrayVar = namedtuple('ArrayVar', [])
 LazyIota = namedtuple('Iota', ['dtype', 'size'])
 LazyEye = namedtuple('Eye', ['dtype', 'shape', 'offset'])
 LazyTri = namedtuple('Tri', ['dtype', 'shape', 'offset'])
+LazyDelta = namedtuple('Delta', ['dtype', 'shape', 'axes'])
 
 def lazy_array(shape):
   return LazyExpr(LazyArrayVar(), shape, tuple(range(len(shape))))
@@ -76,6 +77,9 @@ def lazy_eye(dtype, shape, offset):
 def lazy_tri(dtype, shape, offset):
   assert len(shape) == 2
   return LazyExpr(LazyTri(dtype, shape, offset), shape, (0, 1))
+
+def lazy_delta(dtype, shape, axes):
+  return LazyExpr(LazyDelta(dtype, shape, axes), shape, tuple(range(len(shape))))
 
 def lazy_broadcast(lazy_expr, shape, broadcast_dimensions):
   new_dims = [None] * len(shape)
@@ -106,11 +110,19 @@ def eval_lazy_expr(lazy_expr, x):
     x = onp.arange(input_.size, dtype=input_.dtype)
   elif t is LazyEye:
     assert x is None
-    x = onp.eye(input_.size, dtype=input_.dtype, k=input_.offset)
+    N, M = input_.shape
+    x = onp.eye(N, M, dtype=input_.dtype, k=input_.offset)
   elif t is LazyTri:
     assert x is None
     N, M = input_.shape
     x = onp.tri(N, M, dtype=input_.dtype, k=input_.offset)
+  elif t is LazyDelta:
+    ones = [1] * len(input_.shape)
+    iotas = [onp.arange(input_.shape[i]).reshape(subvals(ones, [(i, -1)]))
+              for i in input_.axes]
+    eyes = [i1 == i2 for i1, i2 in zip(iotas[:-1], iotas[1:])]
+    result = onp.asarray(reduce(op.and_, eyes), input_.dtype)
+    x = onp.broadcast_to(result, input_.shape)
   else:
     assert False
 
@@ -139,18 +151,24 @@ def stage_lazy_expr(c, lazy_expr, x):
     x = c.Iota(input_.dtype, input_.size)
   elif t is LazyEye:
     assert x is None
-    size = input_.size
-    bool_eye = c.Eq(c.Add(c.BroadcastedIota(onp.uint32, (size, size), 0),
-                          c.Constant(onp.array(input_.offset, onp.uint32))),
-                    c.BroadcastedIota(onp.uint32, (size, size), 1))
+    N, M = input_.shape
+    bool_eye = c.Eq(c.Add(c.BroadcastedIota(onp.int32, (N, M), 0),
+                          c.Constant(onp.array(input_.offset, onp.int32))),
+                    c.BroadcastedIota(onp.int32, (N, M), 1))
     x = c.ConvertElementType(bool_eye, xb.dtype_to_etype(input_.dtype))
   elif t is LazyTri:
     assert x is None
     N, M = input_.shape
-    bool_tri = c.Ge(c.Add(c.BroadcastedIota(onp.uint32, (N, M), 0),
-                          c.Constant(onp.array(input_.offset, onp.uint32))),
-                  c.BroadcastedIota(onp.uint32, (N, M), 1))
+    bool_tri = c.Ge(c.Add(c.BroadcastedIota(onp.int32, (N, M), 0),
+                          c.Constant(onp.array(input_.offset, onp.int32))),
+                    c.BroadcastedIota(onp.int32, (N, M), 1))
     x = c.ConvertElementType(bool_tri, xb.dtype_to_etype(input_.dtype))
+  elif t is LazyDelta:
+    etype = xb.dtype_to_etype(input_.dtype)
+    iotas = [c.BroadcastedIota(onp.uint32, input_.shape, axis)
+             for axis in input_.axes]
+    eyes = [c.Eq(i1, i2) for i1, i2 in zip(iotas[:-1], iotas[1:])]
+    x = c.ConvertElementType(reduce(c.And, eyes), etype)
   else:
     assert False
 

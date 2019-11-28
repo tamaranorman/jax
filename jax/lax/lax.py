@@ -608,7 +608,7 @@ def broadcast(operand, sizes):
   return broadcast_in_dim(operand, tuple(sizes) + onp.shape(operand), dims)
 
 def broadcast_in_dim(operand, shape, broadcast_dimensions):
-  assert onp.ndim(operand) == len(broadcast_dimensions)
+  assert onp.ndim(operand) == len(broadcast_dimensions), (operand.shape, broadcast_dimensions)
   if onp.ndim(operand) == len(shape) and not len(broadcast_dimensions):
     return operand
   if any(x < 0 or x >= len(shape) for x in broadcast_dimensions):
@@ -1088,6 +1088,15 @@ def eye(dtype, shape, offset):
   lazy_expr = xla.lazy_eye(dtype, (N, M), offset)
   aval = ShapedArray((N, M), dtype)
   return xla.DeviceArray(aval, lazy_expr, xla.device_constant)
+
+def delta(dtype, shape, axes):
+  shape = tuple(map(int, shape))
+  axes = tuple(map(int, axes))
+  dtype = dtypes.canonicalize_dtype(dtype)
+  lazy_expr = xla.lazy_delta(dtype, shape, axes)
+  aval = ShapedArray(shape, dtype)
+  return xla.DeviceArray(aval, lazy_expr, xla.device_constant)
+broadcasted_eye = delta
 
 def tri(dtype, shape, offset):
   N, M = tuple(map(int, shape))
@@ -4508,13 +4517,6 @@ def _eq_meet(a, b):
     else:
       b = convert_element_type(b, a_dtype)
   return eq(a, b)
-
-
-def subvals(lst, replace):
-  lst = list(lst)
-  for i, v in replace:
-    lst[i] = v
-  return tuple(lst)
 
 
 def _abstractify(x):

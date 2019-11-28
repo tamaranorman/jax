@@ -1361,6 +1361,38 @@ class APITest(jtu.JaxTestCase):
     expected = onp.broadcast_to(onp.arange(3), (5, 3)) + 5
     self.assertAllClose(z, expected, check_dtypes=False)
 
+  def test_lazy_eye(self):
+    if not hasattr(self, "assertLogs"):
+      raise unittest.SkipTest("test requires assertLogs (python 3)")
+
+    lax.add(1, 2)  # make sure some initial warnings are already printed
+
+    with self.assertLogs(level=logging.DEBUG) as l:
+      z = lax.eye(onp.float32, (3, 3), 0) + 5.
+    self.assertLen(l.output, 1)
+    self.assertIn(
+        "iota.1 = u32[3,3] iota(), iota_dimension=0",
+        l.output[-1])
+
+    expected = onp.eye(3, dtype=onp.float32) + 5
+    self.assertAllClose(z, expected, check_dtypes=True)
+
+  def test_lazy_tri(self):
+    if not hasattr(self, "assertLogs"):
+      raise unittest.SkipTest("test requires assertLogs (python 3)")
+
+    lax.add(1, 2)  # make sure some initial warnings are already printed
+
+    with self.assertLogs(level=logging.DEBUG) as l:
+      z = lax.tri(onp.float32, (3, 3), 0) + 7.
+    self.assertLen(l.output, 1)
+    self.assertIn(
+        "iota.1 = u32[3,3] iota(), iota_dimension=0",
+        l.output[-1])
+
+    expected = onp.tri(3, dtype=onp.float32) + 7
+    self.assertAllClose(z, expected, check_dtypes=True)
+
 
 if __name__ == '__main__':
   absltest.main()

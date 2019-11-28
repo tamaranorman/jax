@@ -60,12 +60,22 @@ def identity(x): return x
 LazyExpr = namedtuple('LazyExpr', ['input', 'shape', 'dims'])
 LazyArrayVar = namedtuple('ArrayVar', [])
 LazyIota = namedtuple('Iota', ['dtype', 'size'])
+LazyEye = namedtuple('Eye', ['dtype', 'shape', 'offset'])
+LazyTri = namedtuple('Tri', ['dtype', 'shape', 'offset'])
 
 def lazy_array(shape):
   return LazyExpr(LazyArrayVar(), shape, tuple(range(len(shape))))
 
 def lazy_iota(dtype, size):
   return LazyExpr(LazyIota(dtype, size), (size,), (0,))
+
+def lazy_eye(dtype, shape, offset):
+  assert len(shape) == 2
+  return LazyExpr(LazyEye(dtype, shape, offset), shape, (0, 1))
+
+def lazy_tri(dtype, shape, offset):
+  assert len(shape) == 2
+  return LazyExpr(LazyTri(dtype, shape, offset), shape, (0, 1))
 
 def lazy_broadcast(lazy_expr, shape, broadcast_dimensions):
   new_dims = [None] * len(shape)
@@ -94,6 +104,13 @@ def eval_lazy_expr(lazy_expr, x):
   elif t is LazyIota:
     assert x is None
     x = onp.arange(input_.size, dtype=input_.dtype)
+  elif t is LazyEye:
+    assert x is None
+    x = onp.eye(input_.size, dtype=input_.dtype, k=input_.offset)
+  elif t is LazyTri:
+    assert x is None
+    N, M = input_.shape
+    x = onp.tri(N, M, dtype=input_.dtype, k=input_.offset)
   else:
     assert False
 
@@ -120,6 +137,20 @@ def stage_lazy_expr(c, lazy_expr, x):
   elif t is LazyIota:
     assert x is None
     x = c.Iota(input_.dtype, input_.size)
+  elif t is LazyEye:
+    assert x is None
+    size = input_.size
+    bool_eye = c.Eq(c.Add(c.BroadcastedIota(onp.uint32, (size, size), 0),
+                          c.Constant(onp.array(input_.offset, onp.uint32))),
+                    c.BroadcastedIota(onp.uint32, (size, size), 1))
+    x = c.ConvertElementType(bool_eye, xb.dtype_to_etype(input_.dtype))
+  elif t is LazyTri:
+    assert x is None
+    N, M = input_.shape
+    bool_tri = c.Ge(c.Add(c.BroadcastedIota(onp.uint32, (N, M), 0),
+                          c.Constant(onp.array(input_.offset, onp.uint32))),
+                  c.BroadcastedIota(onp.uint32, (N, M), 1))
+    x = c.ConvertElementType(bool_tri, xb.dtype_to_etype(input_.dtype))
   else:
     assert False
 

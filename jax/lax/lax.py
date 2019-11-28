@@ -1069,36 +1069,33 @@ def iota(dtype, size):
   operator.
   """
   size = int(size)
-  lazy_expr = xla.lazy_iota(dtypes.canonicalize_dtype(dtype), size)
+  dtype = dtypes.canonicalize_dtype(dtype)
+  lazy_expr = xla.lazy_iota(dtype, size)
   aval = ShapedArray((size,), dtype)
   return xla.DeviceArray(aval, lazy_expr, xla.device_constant)
 
 def broadcasted_iota(dtype, shape, dimension):
-  """Wraps XLA's `Iota
-  <https://www.tensorflow.org/xla/operation_semantics#iota>`_
-  operator.
-  """
+  """Convenience wrapper around ``iota``."""
   dtype = dtypes.canonicalize_dtype(dtype)
   shape = _canonicalize_shape(shape)
   dimension = int(dimension)
   return broadcast_in_dim(iota(dtype, shape[dimension]), shape, [dimension])
 
-def eye(dtype, size):
-  return broadcasted_eye(dtype, (size, size), (0, 1))
-
-def broadcasted_eye(dtype, shape, axes):
-  if not isinstance(axes, (list, tuple)) or not len(axes) >= 2:
-    raise TypeError("make_diagonal `axes` must be a tuple with len at least 2.")
+def eye(dtype, shape, offset):
+  N, M = tuple(map(int, shape))
+  offset = int(offset)
   dtype = dtypes.canonicalize_dtype(dtype)
-  shape = _canonicalize_shape(shape)
-  axes = tuple(map(int, axes))
+  lazy_expr = xla.lazy_eye(dtype, (N, M), offset)
+  aval = ShapedArray((N, M), dtype)
+  return xla.DeviceArray(aval, lazy_expr, xla.device_constant)
 
-  ones = [1] * len(shape)
-  iotas = [iota(onp.uint32, shape[i]).reshape(subvals(ones, [(i, -1)]))
-           for i in axes]
-  eyes = [i1 == i2 for i1, i2 in zip(iotas[:-1], iotas[1:])]
-  out = _reduce(operator.and_, eyes)
-  return convert_element_type(out, dtype)
+def tri(dtype, shape, offset):
+  N, M = tuple(map(int, shape))
+  offset = int(offset)
+  dtype = dtypes.canonicalize_dtype(dtype)
+  lazy_expr = xla.lazy_tri(dtype, (N, M), offset)
+  aval = ShapedArray((N, M), dtype)
+  return xla.DeviceArray(aval, lazy_expr, xla.device_constant)
 
 
 def stop_gradient(x):

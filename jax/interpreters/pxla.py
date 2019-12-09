@@ -460,6 +460,18 @@ def parallel_callable(fun, backend, axis_name, axis_size, devices, *avals):
     del master
   out_pvs, out_consts = unzip2(out_pvals)
 
+  # TODO(skye,mattjj): allow more collectives on multi-host as we test them, but
+  # for now raise an error
+  if devices is not None:
+    is_multi_host_pmap = any(d.host_id != xb.host_id() for d in devices)
+  else:
+    is_multi_host_pmap = xb.host_count() > 1
+  if is_multi_host_pmap:
+    used_collectives = set(xla.jaxpr_collectives(jaxpr))
+    if not used_collectives.issubset(multi_host_supported_collectives):
+      msg = "using collectives that aren't supported for multi-host: {}"
+      raise TypeError(msg.format(", ".join(map(str, used_collectives))))
+
   if all(pv is None for pv in out_pvs):
     # When the output doesn't depend on the input we don't need to compile an
     # XLA computation at all; we handle this as a special case so we can stage
@@ -513,6 +525,8 @@ def parallel_callable(fun, backend, axis_name, axis_size, devices, *avals):
                         axis_size, tuple_args)
   handle_outs = _pvals_to_results_handler(axis_size, num_local_replicas, out_pvals)
   return partial(execute_replicated, compiled, backend, num_local_replicas, handle_args, handle_outs)
+
+multi_host_supported_collectives = set()
 
 class ResultToPopulate(object): pass
 result_to_populate = ResultToPopulate()

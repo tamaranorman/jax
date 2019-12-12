@@ -139,11 +139,11 @@ pytype_aval_mappings[core.Unit] = lambda _: core.abstract_unit
 for _t in array_types:
   pytype_aval_mappings[_t] = make_shaped_array
 
-def _make_abstract_python_scalar(aval, _): return aval
+def _make_abstract_python_scalar(typ, _):
+  return ShapedArray((), dtypes.python_scalar_dtypes[typ], weak_type=True)
 
-for _t, _v in dtypes.python_scalar_dtypes.items():
-  pytype_aval_mappings[_t] = partial(
-    _make_abstract_python_scalar, ShapedArray((), _v, weak_type=True))
+for _t in dtypes.python_scalar_dtypes.keys():
+  pytype_aval_mappings[_t] = partial(_make_abstract_python_scalar, _t)
 
 ### op-by-op execution
 
@@ -419,7 +419,7 @@ def _xla_call_impl(fun, *args, **params):
 @lu.cache
 def _xla_callable(fun, device, backend, *abstract_args):
   pvals = [pe.PartialVal((aval, core.unit)) for aval in abstract_args]
-  with core.new_master(pe.JaxprTrace, True) as master:
+  with core.new_master(pe.StagingJaxprTrace, True) as master:
     jaxpr, (pvals, consts, env) = pe.trace_to_subjaxpr(fun, master, False).call_wrapped(pvals)
     assert not env  # no subtraces here
     del master, env

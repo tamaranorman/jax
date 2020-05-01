@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import collections
 from functools import partial
 import itertools
 import re
+from typing import Callable
 from unittest import SkipTest
 
 from absl.testing import absltest
@@ -42,6 +40,12 @@ from jax.config import config
 config.parse_flags_with_absl()
 
 
+def while_loop_reference(cond, body, carry):
+  while cond(carry):
+    carry = body(carry)
+  return carry
+
+
 def scan_reference(f, init, xs):
   carry = init
   ys = []
@@ -54,6 +58,10 @@ def scan_reference(f, init, xs):
 
 def high_precision_dot(a, b):
   return lax.dot(a, b, precision=lax.Precision.HIGHEST)
+
+
+def posify(matrix):
+  return high_precision_dot(matrix, matrix.T.conj())
 
 
 class LaxControlFlowTest(jtu.JaxTestCase):
@@ -329,7 +337,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     """Test typing error messages for while."""
     with self.assertRaisesRegex(
       TypeError, "arguments to fori_loop must have equal types"):
-      lax.fori_loop(np.int16(0), np.int32(10), (lambda i, c: c), np.float32(7))
+      lax.fori_loop(onp.int16(0), np.int32(10), (lambda i, c: c), np.float32(7))
 
   def testForiLoopBatched(self):
     def body_fun(i, loop_carry):
@@ -346,7 +354,9 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
   def testForiLoopBatchedIssue1190(self):
-    f = lambda x: lax.fori_loop(0, 4, lambda _, x: x + 1, x)
+    cond_fun = lambda carry: carry[0] < 4
+    body_fun = lambda carry: (carry[0] + 1, carry[1] + 1)
+    f = lambda x: lax.while_loop(cond_fun, body_fun, (0, x))
     jaxpr = api.make_jaxpr(api.vmap(f))(np.arange(3))
     eqn = jaxpr.jaxpr.eqns[0]
     self.assertIs(eqn.primitive, lax.while_p)
@@ -627,6 +637,209 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
     assert "select" in str(jaxpr)
 
+  def testCondJVP(self):
+    def fun_ref(x):
+      if x < 3:
+        return (x, x)
+      else:
+        y = 2 * x
+        return y, 2 * y
+
+    def fun(x):
+      def false_fun(x):
+        y = 2 * x
+        return y, 2 * y
+      return lax.cond(x < 3, x, lambda x: (x, x), x, false_fun)
+
+    x = 3.14
+    ans = api.jvp(fun, (x,), (x,))
+    expected = api.jvp(fun_ref, (x,), (x,))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x,), order=2, modes=["fwd"])
+
+    x = 2.72
+    ans = api.jvp(fun, (x,), (x,))
+    expected = api.jvp(fun_ref, (x,), (x,))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x,), order=2, modes=["fwd"])
+
+  def testCondJVP2(self):
+    def fun_ref(x):
+      if x < 3:
+        return 2.
+      else:
+        return 2. * x
+
+    def fun(x):
+      return lax.cond(x < 3, (), lambda _: 2., x, lambda x: 2. * x)
+
+    x = 3.14
+    ans = api.jvp(fun, (x,), (x,))
+    expected = api.jvp(fun_ref, (x,), (x,))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x,), order=2, modes=["fwd"])
+
+    x = 2.72
+    ans = api.jvp(fun, (x,), (x,))
+    expected = api.jvp(fun_ref, (x,), (x,))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x,), order=2, modes=["fwd"])
+
+  def testCondGrad(self):
+    def f_ref(x):
+      return 3. * x if x < 2 else np.sin(x)
+
+    def f(x):
+      return lax.cond(x < 2, x, lambda x: 3. * x, x, lambda x: np.sin(x))
+
+    x = 2.14
+    ans = api.grad(f)(x)
+    expected = api.grad(f_ref)(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(f, (x,), order=2, modes=["fwd", "rev"])
+
+    x = 1.72
+    ans = api.grad(f)(x)
+    expected = api.grad(f_ref)(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(f, (x,), order=2, modes=["fwd", "rev"])
+
+  def testCondGrad2(self):
+    def f_ref(x):
+      z = np.array([1., 2.]) * x if x[0] < 2 else np.sin(x)
+      return z.sum()
+
+    def _f(x):
+      return lax.cond(
+          x[0] < 2,
+          x, lambda x: np.array([1., 2.]) * x,
+          x, lambda x: np.sin(x))
+
+    f = lambda x: api.jit(_f)(x).sum()
+
+    x = 2.14 * np.ones(2)
+    ans = api.grad(f)(x)
+    expected = api.grad(f_ref)(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(f, (x,), order=2, modes=["fwd", "rev"])
+
+    x = 1.72 * np.ones(2)
+    ans = api.grad(f)(x)
+    expected = api.grad(f_ref)(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(f, (x,), order=2, modes=["fwd", "rev"])
+
+  def testCondGrad3(self):
+    def fun_ref(x):
+      if x < 3:
+        return 2.
+      else:
+        return 2. * x
+
+    def fun(x):
+      return lax.cond(x < 3, (), lambda _: 2., x, lambda x: 2. * x)
+
+    x = 3.14
+    ans = api.grad(fun)(x)
+    expected = api.grad(fun_ref)(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x,), order=2, modes=["fwd", "rev"])
+
+    x = 2.72
+    ans = api.grad(fun)(x)
+    expected = api.grad(fun_ref)(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x,), order=2, modes=["fwd", "rev"])
+
+  def testCondGrad4(self):
+    def fun_ref(x, y):
+      if x < 3:
+        return 2. * np.sin(y)
+      else:
+        return 2. * np.cos(x)
+
+    def fun(x, y):
+      return lax.cond(
+          x < 3,
+          (), lambda _: 2. * np.sin(y),
+          x,  lambda x: 2. * x)
+
+    y = 5.8
+    x = 3.14
+    ans = api.grad(fun, 1)(x, y)
+    expected = api.grad(fun_ref, 1)(x, y)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x, y), order=2, modes=["fwd", "rev"])
+
+    x = 2.72
+    ans = api.grad(fun, 1)(x, y)
+    expected = api.grad(fun_ref, 1)(x, y)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+    jtu.check_grads(fun, (x, y), order=2, modes=["fwd", "rev"])
+
+  def testCondLinearize(self):
+    def f(x):
+      return lax.cond(x < 2, x, lambda x: 3. * x, x, lambda x: np.sin(x))
+    y, f_lin = api.linearize(f, 1.)
+    self.assertAllClose(y, 3., check_dtypes=False)
+    self.assertAllClose(f_lin(2.), 6., check_dtypes=False)
+    y, f_lin = api.linearize(f, 4.)
+    self.assertAllClose(y, np.sin(4.), check_dtypes=False)
+    self.assertAllClose(f_lin(2.), np.cos(4.) * 2., check_dtypes=False)
+
+  def testCondLinearize2(self):
+    def f_ref(x):
+      z = np.array([1., 2.]) * x if x[0] < 2 else np.cos(np.sin(x))
+      return z.sum()
+
+    def f(x):
+      return lax.cond(
+          x[0] < 2,
+          x, lambda x: np.array([1., 2.]) * x,
+          x, lambda x: np.cos(np.sin(x))).sum()
+
+    x = 2.14 * np.ones(2)
+    y, f_lin = api.linearize(f, x)
+    y_ref, f_lin_ref = api.linearize(f_ref, x)
+    self.assertAllClose(y, y_ref, check_dtypes=False)
+    self.assertAllClose(f_lin(x), f_lin_ref(x), check_dtypes=False)
+
+    x = -2.14 * np.ones(2)
+    y, f_lin = api.linearize(f, x)
+    y_ref, f_lin_ref = api.linearize(f_ref, x)
+    self.assertAllClose(y, y_ref, check_dtypes=False)
+    self.assertAllClose(f_lin(x), f_lin_ref(x), check_dtypes=False)
+
+    f = api.jit(f)
+    x = 2.14 * np.ones(2)
+    y, f_lin = api.linearize(f, x)
+    y_ref, f_lin_ref = api.linearize(f_ref, x)
+    self.assertAllClose(y, y_ref, check_dtypes=False)
+    self.assertAllClose(f_lin(x), f_lin_ref(x), check_dtypes=False)
+
+  def testCondJit(self):
+    def f(x):
+      return lax.cond(x < 2, x, lambda x: 3. * x, x, lambda x: np.sin(x))
+    y = api.jit(f)(1.)
+    expected = f(1.)
+    self.assertAllClose(y, expected, check_dtypes=False)
+    y = api.jit(f)(4.)
+    expected = f(4.)
+    self.assertAllClose(y, expected, check_dtypes=False)
+
+  def testCondVmapGrad(self):
+    # https://github.com/google/jax/issues/2264
+    def f_1(x): return x ** 2
+    def f_2(x): return x ** 3
+
+    def f(x): return lax.cond(x > 0, x, f_1, x, f_2)
+    def g(x): return np.where(x > 0, f_1(x), f_2(x))
+
+    x = np.linspace(-1, 1, 20)
+    ans = api.vmap(api.grad(f))(x)
+    expected = api.vmap(api.grad(g))(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
   def testIssue1263(self):
     def f(rng, x):
       cond = random.bernoulli(rng)
@@ -764,6 +977,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
        "jit_scan": jit_scan, "jit_f": jit_f}
       for jit_scan in [False, True]
       for jit_f in [False, True])
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def testScanGrad(self, jit_scan, jit_f):
     rng = onp.random.RandomState(0)
 
@@ -794,6 +1008,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     jtu.check_grads(partial(scan, f), (c, as_), order=2, modes=["rev"],
                     atol=1e-3, rtol=2e-3)
 
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def testScanRnn(self):
     r = npr.RandomState(0)
 
@@ -1061,6 +1276,12 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     actual = lax.map(f, xs)
     self.assertAllClose(actual, expected, check_dtypes=True)
 
+  def testMapEmpty(self):
+    # https://github.com/google/jax/issues/2412
+    ans = lax.map(lambda x: x * x, np.array([]))
+    expected = np.array([])
+    self.assertAllClose(ans, expected, check_dtypes=True)
+
   def testCaching(self):
     def cond(x):
       assert python_should_be_executing
@@ -1117,6 +1338,100 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     out = lax.while_loop(lambda _: False, lambda _: (), ())  # doesn't crash
     self.assertEqual(out, ())
 
+  @parameterized.named_parameters(
+      {"testcase_name": "_jit_loop={}_jit_body={}_jit_cond={}".format(
+          jit_loop, jit_body, jit_cond),
+       "jit_loop": jit_loop, "jit_body": jit_body, "jit_cond": jit_cond}
+      for jit_loop in [False, True]
+      for jit_body in [False, True]
+      for jit_cond in [False, True])
+  def testWhileJVP(self, jit_loop, jit_body, jit_cond):
+    cond = lambda x: x[0, 2] <= 8
+    body = lambda x: x * x
+
+    if jit_cond:
+      cond = api.jit(cond)
+    if jit_body:
+      body = api.jit(body)
+
+    loop = partial(lax.while_loop, cond, body)
+    if jit_loop:
+      loop = api.jit(loop)
+
+    loop_ref = partial(while_loop_reference, cond, body)
+
+    x = np.arange(9.).reshape((3, 3))
+    ans = api.jvp(loop, (x,), (x,))
+    expected = api.jvp(loop_ref, (x,), (x,))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    jtu.check_grads(loop, (x,), order=2, modes=["fwd"])
+
+  def testWhileJVPViaForiLoop(self):
+    f = lambda x: lax.fori_loop(0, 3, lambda i, x: x * 2, x)
+    self.assertAllClose(f(2.), 16., check_dtypes=False)
+    self.assertAllClose(api.jvp(f, (2.,), (1.,)), (16., 8.), check_dtypes=False)
+    jtu.check_grads(f, (2.,), order=2, modes=["fwd"])
+
+    f = lambda x: lax.fori_loop(0, 3, lambda i, x: x * (i + 1), x)
+    self.assertAllClose(f(2.), 12., check_dtypes=False)
+    self.assertAllClose(api.jvp(f, (2.,), (1.,)), (12., 6.), check_dtypes=False)
+    jtu.check_grads(f, (2.,), order=2, modes=["fwd"])
+
+  def testWhileJVPWithGrowingNonzeroTangents(self):
+    rng = onp.random.RandomState(0)
+
+    def cond(state):
+      i, x, y, z = state
+      return i < 2
+
+    def body(state):
+      i, x, y, z = state
+      y = x * x
+      z = y * y
+      return i + 1, x, y, z
+
+    y, z = rng.randn(2), rng.randn(2)
+    def loop(loop_impl, x):
+      return loop_impl(cond, body, (0, x, y, z))[1]
+
+    loop_lax = partial(loop, lax.while_loop)
+    loop_ref = partial(loop, while_loop_reference)
+
+    x = rng.randn(2)
+    ans = api.jvp(loop_lax, (x,), (x,))
+    expected = api.jvp(loop_ref, (x,), (x,))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    jtu.check_grads(loop_lax, (x,), order=2, modes=["fwd"])
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_loop={}".format(loop), loop=loop)
+      for loop in ["while", "fori", "fori_inside_cond", "fori_inside_scan"])
+  def testWhileGradError(self, loop: str = "fori_inside_scan"):
+    # Raise error for vjp for loops
+    if loop == "while":
+      func = lambda x: lax.while_loop(lambda i: i < 5., lambda i: i + 1., x)
+    elif loop == "fori":
+      func = lambda x: lax.fori_loop(x, x + 2., lambda i, c: c, x)
+    elif loop == "fori_inside_jit":
+      func = api.jit(lambda x: lax.fori_loop(x, x + 2., lambda i, c: c, x))
+    elif loop == "fori_inside_cond":
+      func = lambda x: lax.cond(True, x,
+                                lambda x: lax.fori_loop(x, x + 2., lambda i, c: c, x),
+                                 1., lambda x: x)
+    elif loop == "fori_inside_scan":
+      func = lambda x: lax.scan(lambda c, x: (lax.fori_loop(x, x + 2., lambda i, c1: c1 * c, x),
+                                              None),
+                                x, onp.ones(2))[0]
+    else:
+      assert False
+
+    with self.assertRaisesRegex(ValueError, "Reverse-mode differentiation does not work for lax.while_loop"):
+      api.grad(func)(1.)
+
+    api.linearize(func, 1.)  # Linearization works
+
   def testIssue1316(self):
     def f(carry, _):
       c, key = carry
@@ -1147,12 +1462,13 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def scalar_solve(f, y):
       return y / f(1.0)
 
-    def binary_search(func, x0, low=0.0, high=100.0, tolerance=1e-6):
+    def binary_search(func, x0, low=0.0, high=100.0):
       del x0  # unused
 
       def cond(state):
         low, high = state
-        return high - low > tolerance
+        midpoint = 0.5 * (low + high)
+        return (low < midpoint) & (midpoint < high)
 
       def body(state):
         low, high = state
@@ -1175,15 +1491,15 @@ class LaxControlFlowTest(jtu.JaxTestCase):
                         rtol=1e-7)
     jtu.check_grads(sqrt_cubed, (5.0,), order=2, rtol=1e-3)
 
-    # TODO(shoyer): reenable when batching works
-    # inputs = np.array([4.0, 5.0])
-    # results = api.vmap(sqrt_cubed)(inputs)
-    # self.assertAllClose(results, inputs ** 1.5, check_dtypes=False)
+    inputs = np.array([4.0, 5.0])
+    results = api.vmap(sqrt_cubed)(inputs)
+    self.assertAllClose(results, inputs ** 1.5, check_dtypes=False)
 
     results = api.jit(sqrt_cubed)(5.0)
     self.assertAllClose(results, 5.0 ** 1.5, check_dtypes=False,
                         rtol={onp.float64:1e-7})
 
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_root_vector_with_solve_closure(self):
 
     def vector_solve(f, y):
@@ -1253,6 +1569,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       {"testcase_name": "nonsymmetric", "symmetric": False},
       {"testcase_name": "symmetric", "symmetric": True},
   )
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve(self, symmetric):
 
     def explicit_jacobian_solve(matvec, b):
@@ -1277,12 +1594,12 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     actual = api.jit(linear_solve)(a, b)
     self.assertAllClose(expected, actual, check_dtypes=True)
 
-    # TODO(shoyer): reenable when batching works
-    # c = rng.randn(3, 2)
-    # expected = np.linalg.solve(a, c)
-    # actual = api.vmap(linear_solve, (None, 1), 1)(a, c)
-    # self.assertAllClose(expected, actual, check_dtypes=True)
+    c = rng.randn(3, 2)
+    expected = np.linalg.solve(a, c)
+    actual = api.vmap(linear_solve, (None, 1), 1)(a, c)
+    self.assertAllClose(expected, actual, check_dtypes=True)
 
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_zeros(self):
     def explicit_jacobian_solve(matvec, b):
       return lax.stop_gradient(np.linalg.solve(api.jacobian(matvec)(b), b))
@@ -1302,6 +1619,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     jtu.check_grads(lambda x: linear_solve(a, x), (b,), order=2,
                     rtol={onp.float32: 5e-3})
 
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_iterative(self):
 
     def richardson_iteration(matvec, b, omega=0.1, tolerance=1e-6):
@@ -1330,10 +1648,12 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(expected, actual, atol=1e-5, check_dtypes=True)
     jtu.check_grads(build_and_solve, (a, b), atol=1e-5, order=2, rtol=2e-3)
 
-    # TODO(shoyer): reenable when batching works
-    # a2 = rng.randn(1, 2, 2)
-    # b2 = rng.randn(1, 2, 2)
-    # jtu.check_grads(api.vmap(build_and_solve), (a2, b2), atol=1e-5, order=2)
+    # vmap across an empty dimension
+    jtu.check_grads(
+        api.vmap(build_and_solve), (a[None, :, :], b[None, :]),
+        atol=1e-5,
+        order=2,
+        rtol=2e-3)
 
   def test_custom_linear_solve_cholesky(self):
 
@@ -1348,19 +1668,35 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     a = rng.randn(2, 2)
     b = rng.randn(2)
 
-    expected = np.linalg.solve(high_precision_dot(a, a.T), b)
-    actual = positive_definite_solve(high_precision_dot(a, a.T), b)
+    expected = np.linalg.solve(onp.asarray(posify(a)), b)
+    actual = positive_definite_solve(posify(a), b)
     self.assertAllClose(expected, actual, check_dtypes=True)
 
-    actual = api.jit(positive_definite_solve)(high_precision_dot(a, a.T), b)
+    actual = api.jit(positive_definite_solve)(posify(a), b)
     self.assertAllClose(expected, actual, check_dtypes=True)
 
     # numerical gradients are only well defined if ``a`` is guaranteed to be
     # positive definite.
     jtu.check_grads(
-        lambda x, y: positive_definite_solve(high_precision_dot(x, x.T), y),
+        lambda x, y: positive_definite_solve(posify(x), y),
         (a, b), order=2, rtol=1e-2)
 
+  def test_custom_linear_solve_complex(self):
+
+    def solve(a, b):
+      def solve(matvec, x):
+        return jsp.linalg.solve(a, x)
+      def tr_solve(matvec, x):
+        return jsp.linalg.solve(a.T, x)
+      matvec = partial(high_precision_dot, a)
+      return lax.custom_linear_solve(matvec, b, solve, tr_solve)
+
+    rng = onp.random.RandomState(0)
+    a = 0.5 * rng.randn(2, 2) + 0.5j * rng.randn(2, 2)
+    b = 0.5 * rng.randn(2) + 0.5j * rng.randn(2)
+    jtu.check_grads(solve, (a, b), order=2, rtol=1e-2)
+
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_lu(self):
 
     # TODO(b/143528110): re-enable when underlying XLA TPU issue is fixed
@@ -1391,6 +1727,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     jtu.check_grads(api.jit(linear_solve), (a, b), order=2,
                     rtol={onp.float32: 2e-3})
 
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_linear_solve_without_transpose_solve(self):
 
     def explicit_jacobian_solve(matvec, b):
@@ -1407,9 +1744,81 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
     jtu.check_grads(loss, (a, b), order=2, modes=['fwd'],
                     atol={onp.float32: 2e-3, onp.float64: 1e-11})
+    jtu.check_grads(api.vmap(loss), (a[None,:,:], b[None,:]), order=2,
+                    modes=['fwd'], atol={onp.float32: 2e-3, onp.float64: 1e-11})
 
     with self.assertRaisesRegex(TypeError, "transpose_solve required"):
       api.grad(loss)(a, b)
+
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
+  def test_custom_linear_solve_pytree(self):
+    """Test custom linear solve with inputs and outputs that are pytrees."""
+
+    def unrolled_matvec(mat, x):
+      """Apply a Python list of lists of scalars to a list of scalars."""
+      result = []
+      for i in range(len(mat)):
+        v = 0
+        for j in range(len(x)):
+          if mat[i][j] is not None:
+            v += mat[i][j] * x[j]
+        result.append(v)
+      return result
+
+    def unrolled_substitution_solve(matvec, b, lower_tri):
+      """Solve a triangular unrolled system with fwd/back substitution."""
+      zero = np.zeros(())
+      one = np.ones(())
+      x = [zero for _ in b]
+      ordering = range(len(b)) if lower_tri else range(len(b) - 1, -1, -1)
+      for i in ordering:
+        residual = b[i] - matvec(x)[i]
+        diagonal = matvec([one if i == j else zero for j in range(len(b))])[i]
+        x[i] = residual / diagonal
+      return x
+
+    def custom_unrolled_lower_tri_solve(mat, b):
+      return lax.custom_linear_solve(
+          partial(unrolled_matvec, mat), b,
+          partial(unrolled_substitution_solve, lower_tri=True),
+          partial(unrolled_substitution_solve, lower_tri=False))
+
+    mat = [[1.0, None, None, None, None, None, None],
+           [1.0, 1.0, None, None, None, None, None],
+           [None, 1.0, 1.0, None, None, None, None],
+           [None, None, 1.0, 1.0, None, None, None],
+           [None, None, None, 1.0, 1.0, None, None],
+           [None, None, None, None, None, 2.0, None],
+           [None, None, None, None, None, 4.0, 3.0]]
+
+    rng = onp.random.RandomState(0)
+    b = list(rng.randn(7))
+
+    # Non-batched
+    jtu.check_grads(custom_unrolled_lower_tri_solve, (mat, b), order=2)
+
+    # Batch one element of b (which, because of unrolling, should only affect
+    # the first block of outputs)
+    b_bat = list(b)
+    b_bat[3] = rng.randn(3)
+    jtu.check_grads(
+        api.vmap(
+            custom_unrolled_lower_tri_solve,
+            in_axes=(None, [None, None, None, 0, None, None, None]),
+            out_axes=[0, 0, 0, 0, 0, None, None]), (mat, b_bat),
+        order=2)
+
+    # Batch one element of mat (again only affecting first block)
+    mat[2][1] = rng.randn(3)
+    mat_axis_tree = [
+        [0 if i == 2 and j == 1 else None for j in range(7)] for i in range(7)
+    ]
+    jtu.check_grads(
+        api.vmap(
+            custom_unrolled_lower_tri_solve,
+            in_axes=(mat_axis_tree, None),
+            out_axes=[0, 0, 0, 0, 0, None, None]), (mat, b),
+        order=2)
 
   def test_custom_linear_solve_errors(self):
 
@@ -1453,6 +1862,41 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     ans = arange(10)
     expected = onp.arange(10)
     self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_while_loop_of_pmap(self):
+    # code from jsnoek@
+
+    def body(i, x):
+      result = api.pmap(lambda z: lax.psum(np.sin(z), 'i'), axis_name='i')(x)
+      return result + x
+    f_loop = lambda x: lax.fori_loop(0, 3, body, x)
+    ans = f_loop(np.ones(api.device_count()))
+    del body, f_loop
+
+    def body2(i, x):
+      result = np.broadcast_to(np.sin(x).sum(), x.shape)
+      return result + x
+    g_loop = lambda x: lax.fori_loop(0, 3, body2, x)
+    expected = g_loop(np.ones(api.device_count()))
+
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_while_loop_of_pmap_error_message(self):
+
+    def body(i, x):
+      result = api.pmap(lambda z: lax.psum(np.sin(z), 'i'), axis_name='i')(x)
+      return result + x
+    f_loop = lambda x: lax.fori_loop(0, 3, body, x)
+
+    too_big = 2 * api.device_count()
+
+    self.assertRaisesRegex(
+        ValueError,
+        re.escape(
+            "compiling a primitive computation `while` that requires {} "
+            "replicas, but only {} XLA devices are available on backend {}."
+            .format(too_big, api.device_count(), jtu.device_under_test())),
+        lambda: f_loop(np.ones(too_big)))
 
 
 if __name__ == '__main__':

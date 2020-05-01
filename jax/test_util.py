@@ -12,27 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
+from contextlib import contextmanager
 import functools
 import re
 import itertools as it
 import os
-from unittest import SkipTest
+from typing import Dict, Sequence, Union
+import sys
+import unittest
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
 
 import numpy as onp
 import numpy.random as npr
-
-from six.moves import xrange
+import scipy
 
 from . import api
+from . import core
 from . import dtypes
-from .config import flags
+from . import lax
+from .config import flags, bool_env
 from .util import partial
 from .tree_util import tree_multimap, tree_all, tree_map, tree_reduce
 from .lib import xla_bridge
@@ -51,6 +53,13 @@ flags.DEFINE_integer(
   'num_generated_cases',
   int(os.getenv('JAX_NUM_GENERATED_CASES', 10)),
   help='Number of generated cases to test')
+
+flags.DEFINE_bool(
+    'jax_skip_slow_tests',
+    bool_env('JAX_SKIP_SLOW_TESTS', False),
+    help=
+    'Skip tests marked as slow (> 5 sec).'
+)
 
 EPS = 1e-4
 
@@ -111,7 +120,7 @@ def _assert_numpy_allclose(a, b, atol=None, rtol=None):
   onp.testing.assert_allclose(a, b, **kw)
 
 def tolerance(dtype, tol=None):
-  tol = tol or {}
+  tol = {} if tol is None else tol
   if not isinstance(tol, dict):
     return tol
   tol = {onp.dtype(key): value for key, value in tol.items()}
@@ -223,6 +232,24 @@ def check_vjp(f, f_vjp, args, atol=None, rtol=None, eps=EPS):
 
 def check_grads(f, args, order,
                 modes=["fwd", "rev"], atol=None, rtol=None, eps=None):
+  """Check gradients from automatic differentiation against finite differences.
+
+  Gradients are only checked in a single randomly chosen direction, which
+  ensures that the finite difference calculation does not become prohibitively
+  expensive even for large input/output spaces.
+
+  Args:
+    f: function to check at ``f(*args)``.
+    args: tuple of argument values.
+    order: forward and backwards gradients up to this order are checked.
+    modes: lists of gradient modes to check ('fwd' and/or 'rev').
+    atol: absolute tolerance for gradient equality.
+    rtol: relative tolerance for gradient equality.
+    eps: step size used for finite differences.
+
+  Raises:
+    AssertionError: if gradients do not match.
+  """
   args = tuple(args)
   eps = eps or EPS
 
@@ -245,8 +272,58 @@ def check_grads(f, args, order,
 
   _check_grads(f, args, order)
 
+
+@contextmanager
+def count_primitive_compiles():
+  xla.xla_primitive_callable.cache_clear()
+
+  # We count how many times we call primitive_computation (which is called
+  # inside xla_primitive_callable) instead of xla_primitive_callable so we don't
+  # count cache hits.
+  primitive_computation = xla.primitive_computation
+  count = [0]
+
+  def primitive_computation_and_count(*args, **kwargs):
+    count[0] += 1
+    return primitive_computation(*args, **kwargs)
+
+  xla.primitive_computation = primitive_computation_and_count
+  try:
+    yield count
+  finally:
+    xla.primitive_computation = primitive_computation
+
+
+@contextmanager
+def count_jit_and_pmap_compiles():
+  # No need to clear any caches since we generally jit and pmap fresh callables
+  # in tests.
+
+  jaxpr_subcomp = xla.jaxpr_subcomp
+  count = [0]
+
+  def jaxpr_subcomp_and_count(*args, **kwargs):
+    count[0] += 1
+    return jaxpr_subcomp(*args, **kwargs)
+
+  xla.jaxpr_subcomp = jaxpr_subcomp_and_count
+  try:
+    yield count
+  finally:
+    xla.jaxpr_subcomp = jaxpr_subcomp
+
+
 def device_under_test():
   return FLAGS.jax_test_dut or xla_bridge.get_backend().platform
+
+def if_device_under_test(device_type: Union[str, Sequence[str]],
+                         if_true, if_false):
+  """Chooses `if_true` of `if_false` based on device_under_test."""
+  if device_under_test() in ([device_type] if isinstance(device_type, str)
+                             else device_type):
+    return if_true
+  else:
+    return if_false
 
 def supported_dtypes():
   if device_under_test() == "tpu":
@@ -258,6 +335,11 @@ def supported_dtypes():
             dtypes.bfloat16, onp.float16, onp.float32, onp.float64,
             onp.complex64, onp.complex128}
 
+def skip_if_unsupported_type(dtype):
+  if dtype not in supported_dtypes():
+    raise unittest.SkipTest(
+      f"Type {dtype} not supported on {device_under_test()}")
+
 def skip_on_devices(*disabled_devices):
   """A decorator for test methods to skip the test on certain devices."""
   def skip(test_method):
@@ -266,8 +348,8 @@ def skip_on_devices(*disabled_devices):
       device = device_under_test()
       if device in disabled_devices:
         test_name = getattr(test_method, '__name__', '[unknown test]')
-        raise SkipTest('{} not supported on {}.'
-                       .format(test_name, device.upper()))
+        raise unittest.SkipTest(
+          f"{test_name} not supported on {device.upper()}.")
       return test_method(self, *args, **kwargs)
     return test_method_wrapper
   return skip
@@ -281,11 +363,17 @@ def skip_on_flag(flag_name, skip_value):
       flag_value = getattr(FLAGS, flag_name)
       if flag_value == skip_value:
         test_name = getattr(test_method, '__name__', '[unknown test]')
-        raise SkipTest('{} not supported when FLAGS.{} is {}'
-                       .format(test_name, flag_name, flag_value))
+        raise unittest.SkipTest(
+          f"{test_name} not supported when FLAGS.{flag_name} is {flag_value}")
       return test_method(self, *args, **kwargs)
     return test_method_wrapper
   return skip
+
+# TODO(phawkins): bug https://github.com/google/jax/issues/432
+skip_on_mac_linalg_bug = partial(
+  unittest.skipIf,
+  sys.platform == "darwin" and scipy.version.version > "1.1.0",
+  "Test fails on Mac with new scipy (issue #432)")
 
 
 def format_test_name_suffix(opname, shapes, dtypes):
@@ -343,6 +431,8 @@ def format_shape_dtype_string(shape, dtype):
     return '{}[{}]'.format(dtype_str(dtype), shapestr)
   elif type(shape) is int:
     return '{}[{},]'.format(dtype_str(dtype), shape)
+  elif isinstance(shape, onp.ndarray):
+    return '{}[{}]'.format(dtype_str(dtype), shape)
   else:
     raise TypeError(type(shape))
 
@@ -393,8 +483,8 @@ def rand_small():
   return partial(_rand_dtype, randn, scale=1e-3)
 
 
-def rand_not_small():
-  post = lambda x: x + onp.where(x > 0, 10., -10.)
+def rand_not_small(offset=10.):
+  post = lambda x: x + onp.where(x > 0, offset, -offset)
   randn = npr.RandomState(0).randn
   return partial(_rand_dtype, randn, scale=3., post=post)
 
@@ -544,6 +634,13 @@ def rand_int(low, high=None):
     return randint(low, high=high, size=shape, dtype=dtype)
   return fn
 
+def rand_unique_int():
+  randchoice = npr.RandomState(0).choice
+  def fn(shape, dtype):
+    return randchoice(onp.arange(onp.prod(shape), dtype=dtype),
+                      size=shape, replace=False)
+  return fn
+
 def rand_bool():
   rng = npr.RandomState(0)
   def generator(shape, dtype):
@@ -564,7 +661,24 @@ def check_raises_regexp(thunk, err_type, pattern):
   except err_type as e:
     assert re.match(pattern, str(e)), "{}\n\n{}\n".format(e, pattern)
 
-_CACHED_INDICES = {}
+
+def _iter_eqns(jaxpr):
+  # TODO(necula): why doesn't this search in params?
+  for eqn in jaxpr.eqns:
+    yield eqn
+  for subjaxpr in core.subjaxprs(jaxpr):
+    yield from _iter_eqns(subjaxpr)
+
+def assert_dot_precision(expected_precision, fun, *args):
+  jaxpr = api.make_jaxpr(fun)(*args)
+  precisions = [eqn.params['precision'] for eqn in _iter_eqns(jaxpr.jaxpr)
+                if eqn.primitive == lax.dot_general_p]
+  for precision in precisions:
+    msg = "Unexpected precision: {} != {}".format(expected_precision, precision)
+    assert precision == expected_precision, msg
+
+
+_CACHED_INDICES: Dict[int, Sequence[int]] = {}
 
 def cases_from_list(xs):
   xs = list(xs)
@@ -582,12 +696,20 @@ def cases_from_gens(*gens):
   sizes = [1, 3, 10]
   cases_per_size = int(FLAGS.num_generated_cases / len(sizes)) + 1
   for size in sizes:
-    for i in xrange(cases_per_size):
+    for i in range(cases_per_size):
       yield ('_{}_{}'.format(size, i),) + tuple(gen(size) for gen in gens)
 
 
 class JaxTestCase(parameterized.TestCase):
   """Base class for JAX tests including numerical checks and boilerplate."""
+
+  # TODO(mattjj): this obscures the error messages from failures, figure out how
+  # to re-enable it
+  # def tearDown(self) -> None:
+  #   assert core.reset_trace_state()
+
+  def setUp(self):
+    core.skip_checks = False
 
   def assertArraysAllClose(self, x, y, check_dtypes, atol=None, rtol=None):
     """Assert that x and y are close (up to numerical tolerances)."""
@@ -602,7 +724,7 @@ class JaxTestCase(parameterized.TestCase):
 
   def assertDtypesMatch(self, x, y):
     if FLAGS.jax_enable_x64:
-      self.assertEqual(onp.asarray(x).dtype, onp.asarray(y).dtype)
+      self.assertEqual(_dtype(x), _dtype(y))
 
   def assertAllClose(self, x, y, check_dtypes, atol=None, rtol=None):
     """Assert that x and y, either arrays or nested tuples/lists, are close."""
@@ -618,9 +740,11 @@ class JaxTestCase(parameterized.TestCase):
         self.assertAllClose(x_elt, y_elt, check_dtypes, atol=atol, rtol=rtol)
     elif hasattr(x, '__array__') or onp.isscalar(x):
       self.assertTrue(hasattr(y, '__array__') or onp.isscalar(y))
+      if check_dtypes:
+        self.assertDtypesMatch(x, y)
       x = onp.asarray(x)
       y = onp.asarray(y)
-      self.assertArraysAllClose(x, y, check_dtypes, atol=atol, rtol=rtol)
+      self.assertArraysAllClose(x, y, check_dtypes=False, atol=atol, rtol=rtol)
     elif x == y:
       return
     else:
@@ -632,7 +756,7 @@ class JaxTestCase(parameterized.TestCase):
     expected_clean = re.sub(ignore_space_re, '\n', expected.strip())
     what_clean = re.sub(ignore_space_re, '\n', what.strip())
     self.assertMultiLineEqual(expected_clean, what_clean,
-                              msg="Expecting\n"+expected)
+                              msg="Found\n{}\nExpecting\n{}".format(what, expected))
 
   def _CompileAndCheck(self, fun, args_maker, check_dtypes,
                        rtol=None, atol=None):
@@ -680,7 +804,14 @@ class JaxTestCase(parameterized.TestCase):
   def _CheckAgainstNumpy(self, numpy_reference_op, lax_op, args_maker,
                          check_dtypes=False, tol=None):
     args = args_maker()
-    numpy_ans = numpy_reference_op(*args)
     lax_ans = lax_op(*args)
+    numpy_ans = numpy_reference_op(*args)
     self.assertAllClose(numpy_ans, lax_ans, check_dtypes=check_dtypes,
                         atol=tol, rtol=tol)
+
+
+@contextmanager
+def ignore_warning(**kw):
+  with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", **kw)
+    yield

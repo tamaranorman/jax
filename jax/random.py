@@ -20,32 +20,31 @@ The JAX PRNG system is based on "Parallel random numbers: as easy as 1, 2, 3"
 https://github.com/google/jax/blob/master/design_notes/prng.md
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 from functools import partial
-import itertools
+from typing import Optional, Sequence, Union
 
 import numpy as onp
 
 from . import lax
 from . import numpy as np
-from . import tree_util
 from . import dtypes
-from .api import custom_transforms, defjvp, jit, vmap
-from .numpy.lax_numpy import _constant_like, asarray, stack
+from .api import jit, vmap
+from .numpy.lax_numpy import _constant_like, asarray
 from jax.lib import xla_bridge
+from jax.lib import xla_client
 from jax.lib import cuda_prng
 from jax import core
 from jax import abstract_arrays
+from jax.numpy.linalg import cholesky
 from jax.scipy.special import logit
-from jax.scipy.linalg import cholesky
+from jax.interpreters import ad
 from jax.interpreters import batching
 from jax.interpreters import xla
+from jax.util import prod
 
 
-def PRNGKey(seed):
+def PRNGKey(seed: int) -> np.ndarray:
   """Create a pseudo-random number generator (PRNG) key given an integer seed.
 
   Args:
@@ -68,7 +67,7 @@ def PRNGKey(seed):
   k2 = convert(np.bitwise_and(seed, 0xFFFFFFFF))
   return lax.concatenate([k1, k2], 0)
 
-def _is_prng_key(key):
+def _is_prng_key(key: np.ndarray) -> bool:
   try:
     return key.shape == (2,) and key.dtype == onp.uint32
   except AttributeError:
@@ -182,9 +181,11 @@ def _threefry2x32_gpu_translation_rule(c, k1, k2, x1, x2):
   rank = len(shape)
   def _broadcast(x):
     ndims = c.GetShape(x).rank()
-    return c.BroadcastInDim(x, shape, tuple(range(rank - ndims, rank)))
+    return xla_client.ops.BroadcastInDim(x, shape,
+                                         tuple(range(rank - ndims, rank)))
   return cuda_prng.threefry2x32(
-      c, (_broadcast(k1), _broadcast(k2)), (_broadcast(x1), _broadcast(x2)))
+      xla_bridge.computation_builder_shim(c),
+      (_broadcast(k1), _broadcast(k2)), (_broadcast(x1), _broadcast(x2)))
 
 threefry2x32_p = core.Primitive("threefry2x32")
 threefry2x32_p.multiple_results = True
@@ -192,9 +193,9 @@ threefry2x32_p.def_impl(partial(xla.apply_primitive, threefry2x32_p))
 threefry2x32_p.def_abstract_eval(_threefry2x32_abstract_eval)
 batching.defbroadcasting(threefry2x32_p)
 xla.translations[threefry2x32_p] = xla.lower_fun(
-    partial(_threefry2x32_lowering, use_rolled_loops=False), instantiate=True)
+    partial(_threefry2x32_lowering, use_rolled_loops=False))
 xla.backend_specific_translations['cpu'][threefry2x32_p] = xla.lower_fun(
-    partial(_threefry2x32_lowering, use_rolled_loops=True), instantiate=True)
+    partial(_threefry2x32_lowering, use_rolled_loops=True))
 if cuda_prng:
   xla.backend_specific_translations['gpu'][threefry2x32_p] = \
       _threefry2x32_gpu_translation_rule
@@ -227,7 +228,7 @@ def threefry_2x32(keypair, count):
   return lax.reshape(out[:-1] if odd_size else out, count.shape)
 
 
-def split(key, num=2):
+def split(key: np.ndarray, num: int = 2) -> np.ndarray:
   """Splits a PRNG key into `num` new keys by adding a leading axis.
 
   Args:
@@ -290,9 +291,9 @@ def _random_bits(key, bit_width, shape):
 def _check_shape(name, shape, *param_shapes):
   try:
     shape = tuple(map(int, shape))
-  except TypeError:
+  except TypeError as err:
     msg = "{} requires a concrete tuple of integers as shape argument, got {}."
-    raise ValueError(msg.format(name, shape))
+    raise ValueError(msg.format(name, shape)) from err
   if param_shapes:
     shape_ = lax.broadcast_shapes(shape, *param_shapes)
     if shape != shape_:
@@ -302,7 +303,11 @@ def _check_shape(name, shape, *param_shapes):
       raise ValueError(msg.format(name, shape_, shape))
 
 
-def uniform(key, shape=(), dtype=onp.float64, minval=0., maxval=1.):
+def uniform(key: np.ndarray,
+            shape: Sequence[int] = (),
+            dtype: onp.dtype = onp.float64,
+            minval: Union[float, np.ndarray] = 0.,
+            maxval: Union[float, np.ndarray] = 1.) -> np.ndarray:
   """Sample uniform random values in [minval, maxval) with given shape/dtype.
 
   Args:
@@ -318,6 +323,7 @@ def uniform(key, shape=(), dtype=onp.float64, minval=0., maxval=1.):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _uniform(key, shape, dtype, minval, maxval)
 
 @partial(jit, static_argnums=(1, 2))
@@ -349,7 +355,11 @@ def _uniform(key, shape, dtype, minval, maxval):
       lax.reshape(floats * (maxval - minval) + minval, shape))
 
 
-def randint(key, shape, minval, maxval, dtype=onp.int64):
+def randint(key: np.ndarray,
+            shape: Sequence[int],
+            minval: Union[int, np.ndarray],
+            maxval: Union[int, np.ndarray],
+            dtype: onp.dtype = onp.int64):
   """Sample uniform random values in [minval, maxval) with given shape/dtype.
 
   Args:
@@ -366,6 +376,7 @@ def randint(key, shape, minval, maxval, dtype=onp.int64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _randint(key, shape, minval, maxval, dtype)
 
 @partial(jit, static_argnums=(1, 4))
@@ -409,7 +420,7 @@ def _randint(key, shape, minval, maxval, dtype):
   return lax.add(minval, lax.convert_element_type(random_offset, dtype))
 
 
-def shuffle(key, x, axis=0):
+def shuffle(key: np.ndarray, x: np.ndarray, axis: int = 0) -> np.ndarray:
   """Shuffle the elements of an array uniformly at random along an axis.
 
   Args:
@@ -421,6 +432,32 @@ def shuffle(key, x, axis=0):
     A shuffled version of x.
   """
   return _shuffle(key, x, axis)
+
+
+def permutation(key, x):
+  """
+  Permute elements of an array along its first axis or return a permuted range.
+
+  Args:n
+    key: a PRNGKey used as the random key.
+    x: the array or integer range to be shuffled.
+
+  Returns:
+    A shuffled version of x or array range
+  """
+  if not onp.ndim(x):
+    # scalar case, must be a concrete integer
+    if not onp.issubdtype(lax.dtype(x), onp.integer):
+      raise TypeError("x must be an integer or at least 1-dimensional")
+    x = int(x)
+    return _shuffle(key, np.arange(x), 0)
+  elif onp.ndim(x) == 1:
+    return _shuffle(key, x, 0)
+  else:
+    msg = ("permutation for >1d inputs x not yet implemented, see "
+           "https://github.com/google/jax/issues/2066 for updates.")
+    raise NotImplementedError(msg)
+
 
 @partial(jit, static_argnums=(2,))
 def _shuffle(key, x, axis):
@@ -450,7 +487,9 @@ def _shuffle(key, x, axis):
   return x
 
 
-def normal(key, shape=(), dtype=onp.float64):
+def normal(key: np.ndarray,
+           shape: Sequence[int] = (),
+           dtype: onp.dtype = onp.float64) -> np.ndarray:
   """Sample standard normal random values with given shape and float dtype.
 
   Args:
@@ -464,6 +503,7 @@ def normal(key, shape=(), dtype=onp.float64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _normal(key, shape, dtype)
 
 @partial(jit, static_argnums=(1, 2))
@@ -475,7 +515,11 @@ def _normal(key, shape, dtype):
   return onp.array(onp.sqrt(2), dtype) * lax.erf_inv(u)
 
 
-def multivariate_normal(key, mean, cov, shape=None, dtype=onp.float64):
+def multivariate_normal(key: np.ndarray,
+                        mean: np.ndarray,
+                        cov: np.ndarray,
+                        shape: Optional[Sequence[int]] = None,
+                        dtype: onp.dtype = onp.float64) -> np.ndarray:
   """Sample multivariate normal random values with given mean and covariance.
 
   Args:
@@ -497,6 +541,8 @@ def multivariate_normal(key, mean, cov, shape=None, dtype=onp.float64):
     ``broadcast_shapes(mean.shape[:-1], cov.shape[:-2]) + mean.shape[-1:]``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   return _multivariate_normal(key, mean, cov, shape, dtype)
 
 @partial(jit, static_argnums=(3, 4))
@@ -523,7 +569,11 @@ def _multivariate_normal(key, mean, cov, shape, dtype):
   return mean + np.tensordot(normal_samples, chol_factor, [-1, 1])
 
 
-def truncated_normal(key, lower, upper, shape=None, dtype=onp.float64):
+def truncated_normal(key: np.ndarray,
+                    lower: Union[float, np.ndarray],
+                    upper: Union[float, np.ndarray],
+                    shape: Optional[Sequence[int]] = None,
+                    dtype: onp.dtype = onp.float64) -> np.ndarray:
   """Sample truncated standard normal random values with given shape and dtype.
 
   Args:
@@ -544,6 +594,8 @@ def truncated_normal(key, lower, upper, shape=None, dtype=onp.float64):
     ``shape`` is not None, or else by broadcasting ``lower`` and ``upper``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   return _truncated_normal(key, lower, upper, shape, dtype)
 
 @partial(jit, static_argnums=(3, 4))
@@ -562,7 +614,9 @@ def _truncated_normal(key, lower, upper, shape, dtype):
   return sqrt2 * lax.erf_inv(a + u * (b - a))
 
 
-def bernoulli(key, p=onp.float32(0.5), shape=None):
+def bernoulli(key: np.ndarray,
+              p: np.ndarray = onp.float32(0.5),
+              shape: Optional[Sequence[int]] = None) -> np.ndarray:
   """Sample Bernoulli random values with given shape and mean.
 
   Args:
@@ -578,6 +632,8 @@ def bernoulli(key, p=onp.float32(0.5), shape=None):
     is not None, or else ``p.shape``.
   """
   dtype = dtypes.canonicalize_dtype(lax.dtype(p))
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   if not np.issubdtype(dtype, onp.floating):
     msg = "bernoulli probability `p` must have a floating dtype, got {}."
     raise TypeError(msg.format(dtype))
@@ -594,8 +650,12 @@ def _bernoulli(key, p, shape):
   return uniform(key, shape, lax.dtype(p)) < p
 
 
-def beta(key, a, b, shape=None, dtype=onp.float64):
-  """Sample Bernoulli random values with given shape and mean.
+def beta(key: np.ndarray,
+         a: Union[float, np.ndarray],
+         b: Union[float, np.ndarray],
+         shape: Optional[Sequence[int]] = None,
+         dtype: onp.dtype = onp.float64) -> np.ndarray:
+  """Sample Beta random values with given shape and float dtype.
 
   Args:
     key: a PRNGKey used as the random key.
@@ -614,9 +674,10 @@ def beta(key, a, b, shape=None, dtype=onp.float64):
     ``shape`` is not None, or else by broadcasting ``a`` and ``b``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   return _beta(key, a, b, shape, dtype)
 
-@partial(jit, static_argnums=(3, 4))
 def _beta(key, a, b, shape, dtype):
   if shape is None:
     shape = lax.broadcast_shapes(onp.shape(a), onp.shape(b))
@@ -626,6 +687,8 @@ def _beta(key, a, b, shape, dtype):
   a = lax.convert_element_type(a, dtype)
   b = lax.convert_element_type(b, dtype)
   key_a, key_b = split(key)
+  a = np.broadcast_to(a, shape)
+  b = np.broadcast_to(b, shape)
   gamma_a = gamma(key_a, a, shape, dtype)
   gamma_b = gamma(key_b, b, shape, dtype)
   return gamma_a / (gamma_a + gamma_b)
@@ -645,6 +708,7 @@ def cauchy(key, shape=(), dtype=onp.float64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _cauchy(key, shape, dtype)
 
 @partial(jit, static_argnums=(1, 2))
@@ -656,7 +720,7 @@ def _cauchy(key, shape, dtype):
 
 
 def dirichlet(key, alpha, shape=None, dtype=onp.float64):
-  """Sample Cauchy random values with given shape and float dtype.
+  """Sample Dirichlet random values with given shape and float dtype.
 
   Args:
     key: a PRNGKey used as the random key.
@@ -676,6 +740,8 @@ def dirichlet(key, alpha, shape=None, dtype=onp.float64):
     ``alpha.shape``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   return _dirichlet(key, alpha, shape, dtype)
 
 @partial(jit, static_argnums=(2, 3))
@@ -708,6 +774,7 @@ def exponential(key, shape=(), dtype=onp.float64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _exponential(key, shape, dtype)
 
 @partial(jit, static_argnums=(1, 2))
@@ -781,115 +848,138 @@ _bivariate_coef = [[0.16009398, -0.094634816, 0.025146379, -0.0030648348,
                     0.017050642, -0.0021309345, 0.00085092385, -1.5248239e-07]]
 
 def _gamma_grad_one(z, alpha):
-    # Ref 1: Pathwise Derivatives Beyond the Reparameterization Trick, Martin & Fritz
-    # Ref 2: Case 4 follows https://github.com/fritzo/notebooks/blob/master/gamma-reparameterized.ipynb
+  # Ref 1: Pathwise Derivatives Beyond the Reparameterization Trick, Martin & Fritz
+  # Ref 2: Case 4 follows https://github.com/fritzo/notebooks/blob/master/gamma-reparameterized.ipynb
 
-    # TODO: use lax.cond instead of lax.while_loop when its batching rule is available
-    # See https://github.com/google/jax/issues/490
-    def _case1(zagf):
-        z, alpha, _, flag = zagf
+  # TODO: use lax.cond instead of lax.while_loop when its batching rule is available
+  # See https://github.com/google/jax/issues/490
+  def _case1(zagf):
+    z, alpha, _, flag = zagf
 
-        # dz = - dCDF(z; a) / pdf(z; a)
-        # pdf = z^(a-1) * e^(-z) / Gamma(a)
-        # CDF(z; a) = IncompleteGamma(a, z) / Gamma(a)
-        # dCDF(z; a) = (dIncompleteGamma - IncompleteGamma * Digamma(a)) / Gamma(a)
-        #            =: unnormalized_dCDF / Gamma(a)
-        # IncompleteGamma ~ z^a [ 1/a - z/(a+1) + z^2/2!(a+2) - z^3/3!(a+3) + z^4/4!(a+4) - z^5/5!(a+5) ]
-        #                 =: z^a * term1
-        # dIncompleteGamma ~ z^a * log(z) * term1 - z^a [1/a^2 - z/(a+1)^2 + z^2/2!(a+2)^2
-        #                                                - z^3/3!(a+3)^2 + z^4/4!(a+4)^2 - z^5/5!(a+5)^2 ]
-        #                  =: z^a * log(z) * term1 - z^a * term2
-        # unnormalized_dCDF = z^a { [log(z) - Digamma(a)] * term1 - term2 }
-        zi = 1.0
-        update = zi / alpha
-        term1 = update
-        term2 = update / alpha
-        for i in range(1, 6):
-            zi = -zi * z / i
-            update = zi / (alpha + i)
-            term1 = term1 + update
-            term2 = term2 + update / (alpha + i)
+    # dz = - dCDF(z; a) / pdf(z; a)
+    # pdf = z^(a-1) * e^(-z) / Gamma(a)
+    # CDF(z; a) = IncompleteGamma(a, z) / Gamma(a)
+    # dCDF(z; a) = (dIncompleteGamma - IncompleteGamma * Digamma(a)) / Gamma(a)
+    #            =: unnormalized_dCDF / Gamma(a)
+    # IncompleteGamma ~ z^a [ 1/a - z/(a+1) + z^2/2!(a+2) - z^3/3!(a+3) + z^4/4!(a+4) - z^5/5!(a+5) ]
+    #                 =: z^a * term1
+    # dIncompleteGamma ~ z^a * log(z) * term1 - z^a [1/a^2 - z/(a+1)^2 + z^2/2!(a+2)^2
+    #                                                - z^3/3!(a+3)^2 + z^4/4!(a+4)^2 - z^5/5!(a+5)^2 ]
+    #                  =: z^a * log(z) * term1 - z^a * term2
+    # unnormalized_dCDF = z^a { [log(z) - Digamma(a)] * term1 - term2 }
+    zi = 1.0
+    update = zi / alpha
+    term1 = update
+    term2 = update / alpha
+    for i in range(1, 6):
+        zi = -zi * z / i
+        update = zi / (alpha + i)
+        term1 = term1 + update
+        term2 = term2 + update / (alpha + i)
 
-        unnormalized_cdf_dot = np.power(z, alpha) * ((np.log(z) - lax.digamma(alpha)) * term1 - term2)
-        unnormalized_pdf = np.power(z, alpha - 1) * np.exp(-z)
-        grad = -unnormalized_cdf_dot / unnormalized_pdf
+    unnormalized_cdf_dot = np.power(z, alpha) * ((np.log(z) - lax.digamma(alpha)) * term1 - term2)
+    unnormalized_pdf = np.power(z, alpha - 1) * np.exp(-z)
+    grad = -unnormalized_cdf_dot / unnormalized_pdf
 
-        return z, alpha, grad, ~flag
+    return z, alpha, grad, ~flag
 
-    def _cond2(zagf):
-        z, alpha, _, flag = zagf
-        return (~flag) & (alpha > 8.0) & ((z < 0.9 * alpha) | (z > 1.1 * alpha))
+  def _cond2(zagf):
+    z, alpha, _, flag = zagf
+    return (~flag) & (alpha > 8.0) & ((z < 0.9 * alpha) | (z > 1.1 * alpha))
 
-    def _case2(zagf):
-        z, alpha, _, flag = zagf
+  def _case2(zagf):
+    z, alpha, _, flag = zagf
 
-        # Formula 58 of [1]
-        sqrt_8a = np.sqrt(8 * alpha)
-        z_minus_a = z - alpha
-        log_z_div_a = np.log(z / alpha)
-        sign = np.where(z < alpha, 1.0, -1.0)
-        term1 = 4 * (z + alpha) / (sqrt_8a * z_minus_a * z_minus_a)
-        term2 = log_z_div_a * (sqrt_8a / z_minus_a + sign * np.power(z_minus_a - alpha * log_z_div_a, -1.5))
-        term3 = z * (1.0 + 1.0 / (12 * alpha) + 1.0 / (288 * alpha * alpha)) / sqrt_8a
-        grad = (term1 + term2) * term3
+    # Formula 58 of [1]
+    sqrt_8a = np.sqrt(8 * alpha)
+    z_minus_a = z - alpha
+    log_z_div_a = np.log(z / alpha)
+    sign = np.where(z < alpha, lax._const(z, 1.0), lax._const(z, -1.0))
+    term1 = 4 * (z + alpha) / (sqrt_8a * z_minus_a * z_minus_a)
+    term2 = log_z_div_a * (sqrt_8a / z_minus_a + sign * np.power(z_minus_a - alpha * log_z_div_a, -1.5))
+    term3 = z * (1.0 + 1.0 / (12 * alpha) + 1.0 / (288 * alpha * alpha)) / sqrt_8a
+    grad = (term1 + term2) * term3
 
-        return z, alpha, grad, ~flag
+    return z, alpha, grad, ~flag
 
-    def _cond3(zagf):
-        z, alpha, _, flag = zagf
-        return (~flag) & (alpha > 8.0) & (z >= 0.9 * alpha) & (z <= 1.1 * alpha)
+  def _cond3(zagf):
+    z, alpha, _, flag = zagf
+    return (~flag) & (alpha > 8.0) & (z >= 0.9 * alpha) & (z <= 1.1 * alpha)
 
-    def _case3(zagf):
-        z, alpha, _, flag = zagf
+  def _case3(zagf):
+    z, alpha, _, flag = zagf
 
-        # Formula 59 of [1]
-        z_div_a = np.divide(z, alpha)
-        aa = alpha * alpha
-        term1 = 1440 * alpha + 6 * z_div_a * (53 - 120 * z) - 65 * z_div_a * z_div_a + 3600 * z + 107
-        term2 = 1244160 * alpha * aa
-        term3 = 1 + 24 * alpha + 288 * aa
-        grad = term1 * term3 / term2
+    # Formula 59 of [1]
+    z_div_a = np.divide(z, alpha)
+    aa = alpha * alpha
+    term1 = 1440 * alpha + 6 * z_div_a * (53 - 120 * z) - 65 * z_div_a * z_div_a + 3600 * z + 107
+    term2 = 1244160 * alpha * aa
+    term3 = 1 + 24 * alpha + 288 * aa
+    grad = term1 * term3 / term2
 
-        return z, alpha, grad, ~flag
+    return z, alpha, grad, ~flag
 
-    def _case4(zagf):
-        z, alpha, _, flag = zagf
+  def _case4(zagf):
+    z, alpha, _, flag = zagf
 
-        # Ref [2]
-        u = np.log(z / alpha)
-        v = np.log(alpha)
-        c = []
-        for i in range(8):
-            c.append(_bivariate_coef[0][i] + u * (_bivariate_coef[1][i] + u * _bivariate_coef[2][i]))
-        p = c[0] + v * (c[1] + v * (c[2] + v * c[3]))
-        q = c[4] + v * (c[5] + v * (c[6] + v * c[7]))
-        grad = np.exp(p / np.maximum(q, 0.01))
+    # Ref [2]
+    u = np.log(z / alpha)
+    v = np.log(alpha)
+    c = []
+    for i in range(8):
+        c.append(_bivariate_coef[0][i] + u * (_bivariate_coef[1][i] + u * _bivariate_coef[2][i]))
+    p = c[0] + v * (c[1] + v * (c[2] + v * c[3]))
+    q = c[4] + v * (c[5] + v * (c[6] + v * c[7]))
+    grad = np.exp(p / np.maximum(q, 0.01))
 
-        return z, alpha, grad, ~flag
+    return z, alpha, grad, ~flag
 
-    _, _, grad, flag = lax.while_loop(lambda zagf: (~zagf[3]) & (zagf[0] < 0.8),
-                                      _case1,
-                                      (z, alpha, lax._const(alpha, 0.0), False))
-    _, _, grad, flag = lax.while_loop(_cond2, _case2, (z, alpha, grad, flag))
-    _, _, grad, flag = lax.while_loop(_cond3, _case3, (z, alpha, grad, flag))
-    _, _, grad, flag = lax.while_loop(lambda zagf: ~zagf[3], _case4, (z, alpha, grad, flag))
-    return grad
+  _, _, grad, flag = lax.while_loop(lambda zagf: (~zagf[3]) & (zagf[0] < 0.8),
+                                    _case1,
+                                    (z, alpha, lax._const(alpha, 0.0), False))
+  _, _, grad, flag = lax.while_loop(_cond2, _case2, (z, alpha, grad, flag))
+  _, _, grad, flag = lax.while_loop(_cond3, _case3, (z, alpha, grad, flag))
+  _, _, grad, flag = lax.while_loop(lambda zagf: ~zagf[3], _case4, (z, alpha, grad, flag))
+  return grad
 
 def _gamma_grad(sample, a):
-    samples = np.reshape(sample, -1)
-    alphas = np.reshape(a, -1)
+  samples = np.reshape(sample, -1)
+  alphas = np.reshape(a, -1)
+  if xla_bridge.get_backend().platform == 'cpu':
+    grads = lax.map(lambda args: _gamma_grad_one(*args), (samples, alphas))
+  else:
     grads = vmap(_gamma_grad_one)(samples, alphas)
-    return grads.reshape(onp.shape(a))
+  return grads.reshape(onp.shape(a))
 
-@custom_transforms
 def _gamma_impl(key, a):
-    alphas = np.reshape(a, -1)
-    keys = split(key, onp.size(alphas))
+  a_shape = np.shape(a)
+  # split key to match the shape of a
+  key_ndim = np.ndim(key) - 1
+  key = np.reshape(key, (-1, 2))
+  key = vmap(split, in_axes=(0, None))(key, prod(a_shape[key_ndim:]))
+  keys = np.reshape(key, (-1, 2))
+  alphas = np.reshape(a, -1)
+  if xla_bridge.get_backend().platform == 'cpu':
+    samples = lax.map(lambda args: _gamma_one(*args), (keys, alphas))
+  else:
     samples = vmap(_gamma_one)(keys, alphas)
-    return np.reshape(samples, onp.shape(a))
+  return np.reshape(samples, a_shape),
 
-defjvp(_gamma_impl, None,
-       lambda tangent, ans, key, a, **kwargs: tangent * _gamma_grad(ans, a))
+def _gamma_batching_rule(batched_args, batch_dims):
+    k, a = batched_args
+    bk, ba = batch_dims
+    size = next(t.shape[i] for t, i in zip(batched_args, batch_dims) if i is not None)
+    k = batching.bdim_at_front(k, bk, size)
+    a = batching.bdim_at_front(a, ba, size)
+    return random_gamma_p.bind(k, a), (0,)
+
+random_gamma_p = core.Primitive('random_gamma')
+random_gamma_p.multiple_results = True
+random_gamma_p.def_impl(_gamma_impl)
+random_gamma_p.def_abstract_eval(lambda key, a: (abstract_arrays.raise_to_shaped(a),))
+ad.defjvp2(random_gamma_p, None, lambda tangent, ans, key, a: (tangent * _gamma_grad(ans[0], a),))
+xla.translations[random_gamma_p] = xla.lower_fun(_gamma_impl)
+batching.primitive_batchers[random_gamma_p] = _gamma_batching_rule
 
 def gamma(key, a, shape=None, dtype=onp.float64):
   """Sample Gamma random values with given shape and float dtype.
@@ -909,6 +999,8 @@ def gamma(key, a, shape=None, dtype=onp.float64):
     ``shape`` is not None, or else by ``a.shape``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   return _gamma(key, a, shape, dtype)
 
 @partial(jit, static_argnums=(2, 3))
@@ -921,7 +1013,7 @@ def _gamma(key, a, shape, dtype):
   a = lax.convert_element_type(a, dtype)
   if onp.shape(a) != shape:
     a = np.broadcast_to(a, shape)
-  return _gamma_impl(key, a)
+  return random_gamma_p.bind(key, a)[0]
 
 
 def gumbel(key, shape=(), dtype=onp.float64):
@@ -938,6 +1030,7 @@ def gumbel(key, shape=(), dtype=onp.float64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _gumbel(key, shape, dtype)
 
 @partial(jit, static_argnums=(1, 2))
@@ -946,6 +1039,34 @@ def _gumbel(key, shape, dtype):
   return -np.log(-np.log(
       uniform(key, shape, dtype, minval=np.finfo(dtype).eps, maxval=1.)))
 
+def categorical(key, logits, axis=-1, shape=None):
+  """Sample random values from categorical distributions.
+
+  Args:
+    key: a PRNGKey used as the random key.
+    logits: Unnormalized log probabilities of the categorical distribution(s) to sample from,
+      so that `softmax(logits, axis)` gives the corresponding probabilities.
+    axis: Axis along which logits belong to the same categorical distribution.
+    shape: Optional, a tuple of nonnegative integers representing the result shape.
+      Must be broadcast-compatible with ``onp.delete(logits.shape, axis)``.
+      The default (None) produces a result shape equal to ``onp.delete(logits.shape, axis)``.
+
+  Returns:
+    A random array with int dtype and shape given by ``shape`` if ``shape``
+    is not None, or else ``onp.delete(logits.shape, axis)``.
+  """
+
+  if axis >= 0:
+    axis -= len(logits.shape)
+
+  batch_shape = tuple(onp.delete(logits.shape, axis))
+  if shape is None:
+    shape = batch_shape
+  else:
+    _check_shape("categorical", shape, batch_shape)
+
+  sample_shape = shape[:len(shape)-len(batch_shape)]
+  return np.argmax(gumbel(key, sample_shape + logits.shape, logits.dtype) + logits, axis=axis)
 
 def laplace(key, shape=(), dtype=onp.float64):
   """Sample Laplace random values with given shape and float dtype.
@@ -961,6 +1082,7 @@ def laplace(key, shape=(), dtype=onp.float64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _laplace(key, shape, dtype)
 
 @partial(jit, static_argnums=(1, 2))
@@ -985,6 +1107,7 @@ def logistic(key, shape=(), dtype=onp.float64):
     A random array with the specified shape and dtype.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _logistic(key, shape, dtype)
 
 @partial(jit, static_argnums=(1, 2))
@@ -1011,6 +1134,8 @@ def pareto(key, b, shape=None, dtype=onp.float64):
     ``shape`` is not None, or else by ``b.shape``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  if shape is not None:
+    shape = abstract_arrays.canonicalize_shape(shape)
   return _pareto(key, b, shape, dtype)
 
 @partial(jit, static_argnums=(2, 3))
@@ -1043,6 +1168,7 @@ def t(key, df, shape=(), dtype=onp.float64):
     ``shape`` is not None, or else by ``df.shape``.
   """
   dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
   return _t(key, df, shape, dtype)
 
 @partial(jit, static_argnums=(2, 3))

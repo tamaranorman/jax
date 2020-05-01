@@ -12,24 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import numpy as onp
 from absl.testing import absltest
 from absl.testing import parameterized
 
+import jax
 import jax.numpy as np
 from jax import test_util as jtu
-from jax.abstract_arrays import ShapedArray
 from jax import lax
 from jax import lax_linalg
 from jax import random
 from jax.api import jit, grad, jvp, vjp, make_jaxpr, jacfwd, jacrev, hessian
 from jax.api import vmap
-from jax.core import unit
-from jax.interpreters import partial_eval as pe
 from jax.util import partial, curry
 import jax.ops
 
@@ -299,7 +294,7 @@ class BatchingTest(jtu.JaxTestCase):
     ans = vmap(np.dot, in_axes=(1, None))(xs, ys)
     expected = onp.einsum('ij,i->j', xs, ys)
     self.assertAllClose(ans, expected, check_dtypes=False)
-  
+
   def testDot5(self):
     f = vmap(partial(np.einsum, 'ij,j->i'), (None, 0))
     jaxpr = make_jaxpr(f)(np.zeros((1000, 1000)), np.zeros((1000, 1000)))

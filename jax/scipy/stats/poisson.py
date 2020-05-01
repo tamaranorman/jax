@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import scipy.stats as osp_stats
 
@@ -33,4 +30,4 @@ def logpmf(k, mu, loc=0):
 
 @np._wraps(osp_stats.poisson.pmf, update_doc=False)
 def pmf(k, mu, loc=0):
-  return np.exp(pmf(k, mu, loc))
+  return np.exp(logpmf(k, mu, loc))

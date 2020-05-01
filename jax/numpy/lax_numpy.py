@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pytype: skip-file
 """
 Implements the NumPy API, using the primitives in :mod:`jax.lax`.
 
@@ -23,36 +24,30 @@ transformations for NumPy primitives can be derived from the transformation
 rules for the underlying :code:`lax` primitives.
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-from distutils.util import strtobool
+import builtins
 import collections
-try:
-  from collections.abc import Sequence
-except ImportError:  # python 2
-  from collections import Sequence
+from collections.abc import Sequence
 import itertools
 import os
 import re
 import string
 import types
+from typing import Tuple
 import warnings
 
 import numpy as onp
 import opt_einsum
-import six
-from six.moves import builtins, xrange
 
-from jax import jit, device_put, custom_transforms, defjvp
+from jax import jit, device_put, custom_jvp
 from .. import core
 from .. import dtypes
 from ..abstract_arrays import UnshapedArray, ShapedArray, ConcreteArray
 from ..config import flags
 from ..interpreters.xla import DeviceArray
 from .. import lax
-from ..util import partial, get_module_functions, unzip2, prod as _prod
+from .. import ops
+from ..util import partial, get_module_functions, unzip2, prod as _prod, subvals
 from ..lib import pytree
 from ..lib import xla_client
 
@@ -64,14 +59,15 @@ flags.DEFINE_enum(
     'Control NumPy-style automatic rank promotion broadcasting '
     '("allow", "warn", or "raise").')
 
-if six.PY3:
-  def removechars(s, chars):
-    return s.translate(str.maketrans(dict.fromkeys(chars)))
-else:
-  def removechars(s, chars):
-    return s.translate(None, ''.join(chars))
-
 newaxis = None
+
+# Common docstring additions:
+
+_PRECISION_DOC = """\
+In addition to the original NumPy arguments listed below, also supports
+``precision`` for extra control over matrix-multiplication precision
+on supported devices. See :py:func:`jax.lax.dot` for details.
+"""
 
 # We replace some builtin names to follow Numpy's API, so we capture here.
 _abs = builtins.abs
@@ -103,7 +99,7 @@ set_printoptions = onp.set_printoptions
 # the ndarray class to have a metaclass with special __instancecheck__ behavior.
 _arraylike_types = (onp.ndarray, UnshapedArray, DeviceArray)
 
-class _ArrayMeta(type(onp.ndarray)):
+class _ArrayMeta(type(onp.ndarray)):  # type: ignore
   """Metaclass for overriding ndarray isinstance checks."""
 
   def __instancecheck__(self, instance):
@@ -112,7 +108,11 @@ class _ArrayMeta(type(onp.ndarray)):
     except AttributeError:
       return isinstance(instance, _arraylike_types)
 
-class ndarray(six.with_metaclass(_ArrayMeta, onp.ndarray)):
+class ndarray(onp.ndarray, metaclass=_ArrayMeta):
+  dtype: onp.dtype
+  shape: Tuple[int, ...]
+  size: int
+
   def __init__(shape, dtype=None, buffer=None, offset=0, strides=None,
                order=None):
     raise TypeError("jax.numpy.ndarray() should not be instantiated explicitly."
@@ -126,29 +126,49 @@ ndim = _ndim = onp.ndim
 size = onp.size
 _dtype = dtypes.result_type
 
-bool_ = onp.bool_
-int_ = dtypes.int_
-float_ = dtypes.float_
-complex_ = dtypes.complex_
+# At present JAX doesn't have a reason to distinguish between scalars and arrays
+# in its object system. Further, we want JAX scalars to have the same type
+# promotion behaviors as JAX arrays. Rather than introducing a new type of JAX
+# scalar object with JAX promotion behaviors, instead we make the JAX scalar
+# types return JAX arrays when instantiated.
 
-uint8 = onp.uint8
-uint16 = onp.uint16
-uint32 = onp.uint32
-uint64 = onp.uint64
-int8 = onp.int8
-int16 = onp.int16
-int32 = onp.int32
-int64 = onp.int64
-bfloat16 = dtypes.bfloat16
-float16 = onp.float16
-float32 = single = onp.float32
-float64 = double = onp.float64
-complex64 = csingle = onp.complex64
-complex128 = cdouble = onp.complex128
+class _ScalarMeta(type):
+  def __hash__(self):
+    return hash(self.dtype.type)
 
-flexible = onp.flexible
-character = onp.character
-object_ = onp.object_
+  def __eq__(self, other):
+    return id(self) == id(other) or self.dtype == other
+
+  def __ne__(self, other):
+    return not (self == other)
+
+  def __call__(self, x):
+    return array(self.dtype.type(x), dtype=self.dtype)
+
+def _make_scalar_type(onp_scalar_type):
+  return _ScalarMeta(onp_scalar_type.__name__, (object,),
+                     {"dtype": onp.dtype(onp_scalar_type)})
+
+bool_ = _make_scalar_type(onp.bool_)
+uint8 = _make_scalar_type(onp.uint8)
+uint16 = _make_scalar_type(onp.uint16)
+uint32 = _make_scalar_type(onp.uint32)
+uint64 = _make_scalar_type(onp.uint64)
+int8 = _make_scalar_type(onp.int8)
+int16 = _make_scalar_type(onp.int16)
+int32 = _make_scalar_type(onp.int32)
+int64 = _make_scalar_type(onp.int64)
+bfloat16 = _make_scalar_type(dtypes.bfloat16)
+float16 = _make_scalar_type(onp.float16)
+float32 = single = _make_scalar_type(onp.float32)
+float64 = double = _make_scalar_type(onp.float64)
+complex64 = csingle = _make_scalar_type(onp.complex64)
+complex128 = cdouble = _make_scalar_type(onp.complex128)
+
+int_ = int32 if dtypes.int_ == onp.int32 else int64
+float_ = float32 if dtypes.float_ == onp.float32 else float64
+complex_ = complex64 if dtypes.complex_ == onp.complex64 else complex128
+
 number = onp.number
 inexact = onp.inexact
 complexfloating = onp.complexfloating
@@ -157,12 +177,15 @@ integer = onp.integer
 signedinteger = onp.signedinteger
 unsignedinteger = onp.unsignedinteger
 
+flexible = onp.flexible
+character = onp.character
+object_ = onp.object_
+
 iinfo = dtypes.iinfo
 
 dtype = onp.dtype
 can_cast = dtypes.can_cast
 issubsctype = dtypes.issubsctype
-result_type = dtypes.result_type
 promote_types = dtypes.promote_types
 
 ComplexWarning = onp.ComplexWarning
@@ -293,16 +316,16 @@ def update_numpydoc(docstr, fun, op):
   parameters = '\n'.join(param_list).replace('@@', '\n    ')
   return docstr[:begin_idx + 1] + parameters + docstr[end_idx - 2:]
 
-_numpy_signature_re = re.compile(r'^([\w., ]+=)?\s*[\w\.]+\(.*\)$')
+_numpy_signature_re = re.compile(r'^([\w., ]+=)?\s*[\w\.]+\([\w\W]*\)$')
 
 def _wraps(fun, update_doc=True, lax_description=""):
   """Like functools.wraps but works with numpy.ufuncs.
-     It is important that when wrapping numpy functions the parameters names 
+     It is important that when wrapping numpy functions the parameters names
      in the original function and in the JAX version are the same
     Parameters:
       fun: The function being wrapped
       update_doc: whether to transform the numpy docstring to remove references of
-      parameters that are supported by the numpy version but not the JAX version. 
+      parameters that are supported by the numpy version but not the JAX version.
       If False, include the numpy docstring verbatim.
   """
   def wrap(op):
@@ -322,7 +345,7 @@ def _wraps(fun, update_doc=True, lax_description=""):
 
       signatures = []
       summary = None
-      for i in xrange(len(sections)):
+      for i in range(len(sections)):
         if _numpy_signature_re.match(sections[i]):
           signatures.append(sections[i])
         else:
@@ -357,16 +380,27 @@ def _canonicalize_axis(axis, num_dims):
 
 ### implementations of numpy functions in terms of lax
 
+@_wraps(onp.fmin)
+def fmin(x1, x2):
+  return where((x1 < x2) | isnan(x2), x1, x2)
+
+@_wraps(onp.fmax)
+def fmax(x1, x2):
+  return where((x1 > x2) | isnan(x2), x1, x2)
+
 @_wraps(onp.finfo)
-def finfo(dtype): return dtypes.finfo(dtype)
+def finfo(dtype): 
+  return dtypes.finfo(dtype)
 
 @_wraps(onp.issubdtype)
-def issubdtype(arg1, arg2): return dtypes.issubdtype(arg1, arg2)
-
-issubdtype = dtypes.issubdtype
+def issubdtype(arg1, arg2):
+  return dtypes.issubdtype(arg1, arg2)
 
 @_wraps(onp.isscalar)
-def isscalar(num): return dtypes.is_python_scalar(num) or onp.isscalar(num)
+def isscalar(num):
+  return dtypes.is_python_scalar(num) or onp.isscalar(num)
+
+iterable = onp.iterable
 
 @_wraps(onp.result_type)
 def result_type(*args):
@@ -388,12 +422,17 @@ def _one_to_one_binop(numpy_fn, lax_fn, promote_to_inexact=False):
     fn = lambda x1, x2: lax_fn(*_promote_args(numpy_fn.__name__, x1, x2))
   return _wraps(numpy_fn)(fn)
 
+def _maybe_bool_binop(numpy_fn, lax_fn, bool_lax_fn):
+  def fn(x1, x2):
+    x1, x2 = _promote_args(numpy_fn.__name__, x1, x2)
+    return lax_fn(x1, x2) if x1.dtype != bool_ else bool_lax_fn(x1, x2)
+  return _wraps(numpy_fn)(fn)
+
 absolute = abs = _one_to_one_unop(onp.absolute, lax.abs)
 fabs = _one_to_one_unop(onp.fabs, lax.abs, True)
 bitwise_not = _one_to_one_unop(onp.bitwise_not, lax.bitwise_not)
 negative = _one_to_one_unop(onp.negative, lax.neg)
 positive = _one_to_one_unop(onp.positive, lambda x: x)
-sign = _one_to_one_unop(onp.sign, lax.sign)
 
 floor = _one_to_one_unop(onp.floor, lax.floor, True)
 ceil = _one_to_one_unop(onp.ceil, lax.ceil, True)
@@ -409,24 +448,29 @@ arccos = _one_to_one_unop(onp.arccos, lax.acos, True)
 arctan = _one_to_one_unop(onp.arctan, lax.atan, True)
 sinh = _one_to_one_unop(onp.sinh, lax.sinh, True)
 cosh = _one_to_one_unop(onp.cosh, lax.cosh, True)
+arcsinh = _one_to_one_unop(onp.arcsinh, lax.asinh, True)
 tanh = _one_to_one_unop(onp.tanh, lax.tanh, True)
+arcsinh = _one_to_one_unop(onp.arcsinh, lax.asinh, True)
+arccosh = _one_to_one_unop(onp.arccosh, lax.acosh, True)
+arctanh = _one_to_one_unop(onp.arctanh, lax.atanh, True)
 sqrt = _one_to_one_unop(onp.sqrt, lax.sqrt, True)
 
 
-add = _one_to_one_binop(onp.add, lax.add)
+add = _maybe_bool_binop(onp.add, lax.add, lax.bitwise_or)
 bitwise_and = _one_to_one_binop(onp.bitwise_and, lax.bitwise_and)
 bitwise_or = _one_to_one_binop(onp.bitwise_or, lax.bitwise_or)
 bitwise_xor = _one_to_one_binop(onp.bitwise_xor, lax.bitwise_xor)
 right_shift = _one_to_one_binop(onp.right_shift, lax.shift_right_arithmetic)
 left_shift = _one_to_one_binop(onp.left_shift, lax.shift_left)
 equal = _one_to_one_binop(onp.equal, lax.eq)
-multiply = _one_to_one_binop(onp.multiply, lax.mul)
+multiply = _maybe_bool_binop(onp.multiply, lax.mul, lax.bitwise_and)
 not_equal = _one_to_one_binop(onp.not_equal, lax.ne)
 subtract = _one_to_one_binop(onp.subtract, lax.sub)
 arctan2 = _one_to_one_binop(onp.arctan2, lax.atan2, True)
 minimum = _one_to_one_binop(onp.minimum, lax.min)
 maximum = _one_to_one_binop(onp.maximum, lax.max)
 float_power = _one_to_one_binop(onp.float_power, lax.pow, True)
+nextafter = _one_to_one_binop(onp.nextafter, lax.nextafter, True)
 
 
 def _comparison_op(numpy_fn, lax_fn):
@@ -452,7 +496,7 @@ def _logical_op(np_op, bitwise_op):
   @_wraps(np_op, update_doc=False)
   def op(*args):
     zero = lambda x: lax.full_like(x, shape=(), fill_value=0)
-    args = (x if issubdtype(_dtype(x), onp.bool_) else lax.ne(x, zero(x))
+    args = (x if issubdtype(_dtype(x), bool_) else lax.ne(x, zero(x))
             for x in args)
     return bitwise_op(*_promote_args(np_op.__name__, *args))
   return op
@@ -461,6 +505,34 @@ logical_and = _logical_op(onp.logical_and, lax.bitwise_and)
 logical_not = _logical_op(onp.logical_not, lax.bitwise_not)
 logical_or = _logical_op(onp.logical_or, lax.bitwise_or)
 logical_xor = _logical_op(onp.logical_xor, lax.bitwise_xor)
+
+
+@_wraps(onp.rint)
+def rint(x):
+  dtype = _dtype(x)
+  if issubdtype(dtype, integer):
+    return lax.convert_element_type(x, float_)
+  if issubdtype(dtype, complexfloating):
+    return lax.complex(rint(lax.real(x)), rint(lax.imag(x)))
+  return _round_to_nearest_even(x)
+
+
+@_wraps(onp.sign)
+def sign(x):
+  dtype = _dtype(x)
+  if issubdtype(dtype, complexfloating):
+    re = lax.real(x)
+    return lax.complex(
+      lax.sign(where(re != 0, re, lax.imag(x))), _constant_like(re, 0))
+  return lax.sign(x)
+
+
+@_wraps(onp.copysign)
+def copysign(x1, x2):
+  if issubdtype(_dtype(x1), complexfloating) or issubdtype(_dtype(x2), complexfloating):
+    raise TypeError("copysign does not support complex-valued inputs")
+  x1, x2 = _promote_shapes("copysign", x1, x2)
+  return where(signbit(x2), -lax.abs(x1), lax.abs(x1))
 
 
 @_wraps(onp.true_divide)
@@ -474,7 +546,7 @@ def divide(x1, x2):
   # decide whether to perform integer division based on Numpy result dtype, as a
   # way to check whether Python 3 style division is active in Numpy
   result_dtype = _result_dtype(onp.divide, x1, x2)
-  if issubdtype(result_dtype, onp.integer):
+  if issubdtype(result_dtype, integer):
     return floor_divide(x1, x2)
   else:
     return true_divide(x1, x2)
@@ -507,7 +579,7 @@ def floor_divide(x1, x2):
 @_wraps(onp.divmod)
 def divmod(x1, x2):
   x1, x2 = _promote_args("divmod", x1, x2)
-  if issubdtype(_dtype(x1), onp.integer):
+  if issubdtype(_dtype(x1), integer):
     return floor_divide(x1, x2), remainder(x1, x2)
   else:
     return _float_divmod(x1, x2)
@@ -527,8 +599,6 @@ def _float_divmod(x1, x2):
 
 @_wraps(onp.power)
 def power(x1, x2):
-  x1 = asarray(x1)
-  x2 = asarray(x2)
   x1, x2 = _promote_args(onp.power, x1, x2)
   dtype = _dtype(x1)
   if not issubdtype(dtype, integer):
@@ -539,7 +609,7 @@ def power(x1, x2):
   # TODO(phawkins): add integer pow support to XLA.
   bits = 6  # Anything more would overflow for any x1 > 1
   acc = ones(shape(x1), dtype=dtype)
-  for _ in xrange(bits):
+  for _ in range(bits):
     acc = where(lax.bitwise_and(x2, _constant_like(x2, 1)),
                 lax.mul(acc, x1), acc)
     x1 = lax.mul(x1, x1)
@@ -547,6 +617,7 @@ def power(x1, x2):
   return acc
 
 
+@custom_jvp
 @_wraps(onp.logaddexp)
 def logaddexp(x1, x2):
   x1, x2 = _promote_shapes("logaddexp", *_promote_dtypes_inexact(x1, x2))
@@ -556,7 +627,21 @@ def logaddexp(x1, x2):
                     lax.add(x1, x2),  # NaNs or infinities of the same sign.
                     lax.add(amax, lax.log1p(lax.exp(-lax.abs(delta)))))
 
+@logaddexp.defjvp
+def _logaddexp_jvp(primals, tangents):
+  x1, x2 = primals
+  t1, t2 = tangents
+  x1, x2, t1, t2 = broadcast_arrays(x1, x2, t1, t2)
+  primal_out = logaddexp(x1, x2)
+  tangent_out = (t1 * exp(_replace_inf(x1) - _replace_inf(primal_out)) +
+                 t2 * exp(_replace_inf(x2) - _replace_inf(primal_out)))
+  return primal_out, tangent_out
 
+def _replace_inf(x):
+  return lax.select(isposinf(x), zeros_like(x), x)
+
+
+@custom_jvp
 @_wraps(onp.logaddexp2)
 def logaddexp2(x1, x2):
   x1, x2 = _promote_shapes("logaddexp2", *_promote_dtypes_inexact(x1, x2))
@@ -566,6 +651,15 @@ def logaddexp2(x1, x2):
                     lax.add(x1, x2),  # NaNs or infinities of the same sign.
                     lax.add(amax, lax.div(lax.log1p(exp2(-lax.abs(delta))),
                                           _constant_like(x1, onp.log(2)))))
+@logaddexp2.defjvp
+def _logaddexp2_jvp(primals, tangents):
+  x1, x2 = primals
+  t1, t2 = tangents
+  x1, x2, t1, t2 = broadcast_arrays(x1, x2, t1, t2)
+  primal_out = logaddexp2(x1, x2)
+  tangent_out = (t1 * 2 ** (_replace_inf(x1) - _replace_inf(primal_out)) +
+                 t2 * 2 ** (_replace_inf(x2) - _replace_inf(primal_out)))
+  return primal_out, tangent_out
 
 
 @_wraps(onp.log2)
@@ -584,7 +678,6 @@ def log10(x):
 def exp2(x):
   x, = _promote_dtypes_inexact(x)
   return lax.exp(lax.mul(lax.log(_constant_like(x, 2)), x))
-
 
 @_wraps(onp.signbit)
 def signbit(x):
@@ -617,6 +710,137 @@ def signbit(x):
 
   x = lax.bitcast_convert_type(x, int_type)
   return lax.convert_element_type(x >> (info.nexp + info.nmant), onp.bool)
+
+
+@_wraps(onp.trunc)
+def trunc(x):
+  return where(lax.lt(x, lax._const(x, 0)), lax.ceil(x), lax.floor(x))
+
+
+def _conv(x, y, mode, op, precision):
+  if issubdtype(x.dtype, complexfloating) or issubdtype(y.dtype, complexfloating):
+    raise NotImplementedError(f"{op}() does not support complex inputs")
+  if ndim(x) != 1 or ndim(y) != 1:
+    raise ValueError(f"{op}() only support 1-dimensional inputs.")
+  x, y = _promote_dtypes_inexact(x, y)
+  
+  out_order = slice(None)
+  if len(x) < len(y):
+    x, y = y, x
+    if op == "correlate":
+      out_order = slice(None, None, -1)
+  if op == 'convolve':
+    y = y[::-1]
+
+  if mode == 'valid':
+    padding = [(0, 0)]
+  elif mode == 'same':
+    padding = [(y.shape[0] // 2, y.shape[0] - y.shape[0] // 2 - 1)]
+  elif mode == 'full':
+    padding = [(y.shape[0] - 1, y.shape[0] - 1)]
+  else:
+    raise ValueError("mode must be one of ['full', 'same', 'valid']")
+
+  result = lax.conv_general_dilated(x[None, None, :], y[None, None, :], (1,),
+                                    padding, precision=precision)
+  return result[0, 0, out_order]
+
+
+@_wraps(onp.convolve, lax_description=_PRECISION_DOC)
+def convolve(x, y, mode='full', *, precision=None):
+  return _conv(x, y, mode, 'convolve', precision)
+
+
+@_wraps(onp.correlate, lax_description=_PRECISION_DOC)
+def correlate(x, y, mode='valid', *, precision=None):
+  return _conv(x, y, mode, 'correlate', precision)
+
+
+def _normalize_float(x):
+    info = finfo(_dtype(x))
+    cond = lax.abs(x) < info.tiny
+    x1 = where(cond, x * (1 << info.nmant), x)
+    x2 = where(cond,
+               full_like(x, -info.nmant, dtype=onp.int32),
+               zeros_like(x, dtype=onp.int32))
+    return lax.convert_element_type(x1, _dtype(x)), x2
+
+_INT_DTYPES = {
+  16: onp.int16,
+  32: onp.int32,
+  64: onp.int64,
+}
+
+@_wraps(onp.ldexp)
+@jit
+def ldexp(x1, x2):
+  dtype = _result_dtype(onp.ldexp, x1, x2)
+  x1, x2 = _promote_shapes("ldexp", x1, x2)
+  x1 = lax.convert_element_type(x1, dtype)
+
+  info = finfo(dtype)
+  mask = (1 << info.nexp) - 1
+  bias = ((1 << info.nexp) - 1) >> 1
+
+  int_type = _INT_DTYPES[info.bits]
+
+  x, e = _normalize_float(x1)
+  x2 += lax.convert_element_type(e, onp.int32)
+  x = lax.bitcast_convert_type(x, int_type)
+  x2 += ((x >> info.nmant) & mask) - bias
+
+  # find underflow/overflow before denormalization
+  underflow_cond = x2 < -(bias + info.nmant)
+  overflow_cond = x2 > bias
+
+  m = ones_like(x, dtype=dtype)
+
+  # denormals
+  cond = x2 < -bias + 1
+  x2 = where(cond, x2 + info.nmant, x2)
+  m = where(cond, m / (1 << info.nmant), m)
+
+  x2 = lax.convert_element_type(x2, onp.int32)
+  x &= ~(mask << info.nmant)
+  x |= ((lax.convert_element_type(x2, int_type) + bias) << info.nmant)
+
+  x = lax.convert_element_type(m, dtype) * lax.bitcast_convert_type(x, dtype)
+
+  # underflow
+  x = where(underflow_cond, zeros_like(x, dtype=dtype), x)
+  # overflow
+  x = where(overflow_cond, lax.sign(x1) * full_like(x, onp.inf), x)
+  # ldexp(x1, x2) = x1 for x1 = inf, -inf, nan, 0
+  return where(isinf(x1) | isnan(x1) | (x1 == 0), x1, x)
+
+
+@_wraps(onp.frexp)
+@jit
+def frexp(x):
+  x = asarray(x)
+  if issubdtype(x.dtype, complexfloating):
+    raise TypeError("frexp does not support complex-valued inputs")
+  elif not issubdtype(x.dtype, floating):
+    x = lax.convert_element_type(x, float_)
+
+  dtype = _dtype(x)
+  info = finfo(dtype)
+  mask = (1 << info.nexp) - 1
+  bias = ((1 << info.nexp) - 1) >> 1
+
+  int_type = _INT_DTYPES[info.bits]
+
+  x1, x2 = _normalize_float(x)
+  print(x1, x2)
+  x1 = lax.bitcast_convert_type(x1, int_type)
+  x2 += ((x1 >> info.nmant) & mask) - bias + 1
+  x1 &= ~(mask << info.nmant)
+  x1 |= (bias - 1) << info.nmant
+  x1 = lax.bitcast_convert_type(x1, dtype)
+
+  cond = isinf(x) | isnan(x) | (x == 0)
+  x2 = where(cond, zeros_like(x2), x2)
+  return where(cond, x, x1), lax.convert_element_type(x2, int32)
 
 
 @_wraps(onp.remainder)
@@ -686,52 +910,6 @@ def sinc(x):
   pi_x = lax.mul(lax._const(x, pi), safe_x)
   return where(eq_zero,
                lax._const(x, 1), lax.div(lax.sin(pi_x), pi_x))
-
-
-@_wraps(onp.arcsinh)
-@custom_transforms
-@jit
-@lax._upcast_fp16_for_computation
-def arcsinh(x):
-  # asinh(x) = log(x + sqrt(x**2 + 1))
-  x, = _promote_dtypes_inexact(x)
-  one = lax._const(x, 1)
-  result = lax.log(x + lax.sqrt(x * x + one))
-  if issubdtype(_dtype(result), onp.complexfloating):
-    return result
-  a = abs(x)
-  sqrt_max_value = onp.sqrt(finfo(_dtype(x)).max)
-  log2 = lax._const(a, onp.log(2))
-  return lax.select(a < sqrt_max_value, result, lax.sign(x) * (lax.log(a) + log2))
-
-defjvp(arcsinh, lambda g, ans, x: g / lax.sqrt(lax._const(x, 1) + square(x)))
-
-
-@_wraps(onp.arccosh)
-@jit
-@lax._upcast_fp16_for_computation
-def arccosh(x):
-  # acosh(x) = log(x + sqrt((x + 1) * (x - 1))) if x < sqrt_max_value
-  #            log(x) + log(2) otherwise
-  x, = _promote_dtypes_inexact(x)
-  one = lax._const(x, 1)
-  result = lax.log(x + lax.sqrt((x + one) * (x - one)))
-  if issubdtype(_dtype(result), onp.complexfloating):
-    return result
-  sqrt_max_value = onp.sqrt(finfo(_dtype(x)).max)
-  log2 = lax._const(x, onp.log(2))
-  return lax.select(x < sqrt_max_value, result, lax.log(x) + log2)
-
-
-@_wraps(onp.arctanh)
-def arctanh(x):
-  # atanh(x) = 0.5 * log((1 + x) / (1 - x))
-  x, = _promote_dtypes_inexact(x)
-  one = lax._const(x, 1)
-  result = lax._const(x, 0.5) * lax.log((one + x) / (one - x))
-  if issubdtype(_dtype(result), onp.complexfloating):
-    return result
-  return lax.select(abs(x) <= 1, result, lax.full_like(x, onp.nan))
 
 
 @_wraps(onp.transpose)
@@ -843,6 +1021,65 @@ def diff(a, n=1, axis=-1,):
   return a
 
 
+@partial(jit, static_argnums=(1, 2))
+def _gradient(a, varargs, axis):
+  def gradient_along_axis(a, h, axis):
+    sliced = partial(lax.slice_in_dim, a, axis=axis)
+    a_grad = concatenate((
+      (sliced(1, 2) - sliced(0, 1)),  # upper edge
+      (sliced(2, None) - sliced(None, -2)) * 0.5,  # inner
+      (sliced(-1, None) - sliced(-2, -1)),  # lower edge
+    ), axis)
+    return a_grad / h
+
+  if axis is None:
+    axis = range(a.ndim)
+  else:
+    if isinstance(axis, int):
+      axis = (axis,)
+    if not isinstance(axis, tuple) and not isinstance(axis, list):
+      raise ValueError("Give `axis` either as int or iterable")
+    elif len(axis) == 0:
+      return []
+    axis = [_canonicalize_axis(i, a.ndim) for i in axis]
+
+  if min([s for i, s in enumerate(a.shape) if i in axis]) < 2:
+    raise ValueError("Shape of array too small to calculate "
+                     "a numerical gradient, "
+                     "at least 2 elements are required.")
+  len_axes = len(axis)
+  n = len(varargs)
+  if n == 0 or varargs is None:
+    # no spacing
+    dx = [1.0] * len_axes
+  elif n == 1:
+    # single value for all axes
+    dx = varargs * len_axes
+  elif n == len_axes:
+    dx = varargs
+  else:
+    TypeError("Invalid number of spacing arguments %d" % n)
+
+  if ndim(dx[0]) != 0:
+    raise NotImplementedError("Non-constant spacing not implemented")
+
+  # TODO: use jax.lax loop tools if possible
+  a_grad = [gradient_along_axis(a, h, ax) for ax, h in zip(axis, dx)]
+
+  if len(axis) == 1:
+    a_grad = a_grad[0]
+
+  return a_grad
+
+
+@_wraps(onp.gradient)
+def gradient(a, *args, **kwargs):
+  axis = kwargs.pop("axis", None)
+  if not len(kwargs) == 0:
+    raise ValueError("Only `axis` keyword is implemented")
+  return _gradient(a, args, axis)
+
+
 @_wraps(onp.isrealobj)
 def isrealobj(x):
   return not iscomplexobj(x)
@@ -855,10 +1092,18 @@ def reshape(a, newshape, order="C"):
   except AttributeError:
     return _reshape(a, newshape, order=order)
 
-def _reshape(a, newshape, order="C"):
-  dummy_val = onp.broadcast_to(0, shape(a))  # zero strides
-  computed_newshape = onp.reshape(dummy_val, newshape).shape
+def _compute_newshape(a, newshape):
+  """Fixes a -1 value in newshape, if present."""
+  # other errors, like having more than one -1, are caught downstream
+  newsize = _prod(newshape)
+  if newsize < 0:
+    fix = a.size // -newsize
+    return [d if d != -1 else fix for d in newshape]
+  else:
+    return newshape
 
+def _reshape(a, newshape, order="C"):
+  computed_newshape = _compute_newshape(a, newshape)
   if order == "C":
     return lax.reshape(a, computed_newshape, None)
   elif order == "F":
@@ -893,15 +1138,19 @@ def ravel(a, order="C"):
 
 @_wraps(onp.squeeze)
 def squeeze(a, axis=None):
-  if 1 not in shape(a):
-    return a
+  shape_a = shape(a)
   if axis is None:
-    newshape = [d for d in shape(a) if d != 1]
+    if 1 not in shape_a:
+      return a
+    newshape = [d for d in shape_a if d != 1]
   else:
     if isinstance(axis, int):
       axis = (axis,)
     axis = frozenset(_canonicalize_axis(i, ndim(a)) for i in axis)
-    newshape = [d for i, d in enumerate(shape(a))
+    if _any(shape_a[a] != 1 for a in axis):
+      raise ValueError("cannot select an axis to squeeze out which has size "
+                       "not equal to one")
+    newshape = [d for i, d in enumerate(shape_a)
                 if d != 1 or i not in axis]
   return lax.reshape(a, newshape)
 
@@ -938,7 +1187,7 @@ def moveaxis(a, source, destination):
 
 
 @_wraps(onp.isclose)
-def isclose(a, b, rtol=1e-05, atol=1e-08):
+def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
   a, b = _promote_args("isclose", asarray(a), asarray(b))
   dtype = _dtype(a)
   if issubdtype(dtype, inexact):
@@ -949,6 +1198,27 @@ def isclose(a, b, rtol=1e-05, atol=1e-08):
     out = lax.le(
       lax.abs(lax.sub(a, b)),
       lax.add(atol, lax.mul(rtol, lax.abs(b))))
+    # This corrects the comparisons for infinite and nan values
+    a_inf = isinf(a)
+    b_inf = isinf(b)
+    any_inf = logical_or(a_inf, b_inf)
+    both_inf = logical_and(a_inf, b_inf)
+    # Make all elements where either a or b are infinite to False
+    out = logical_and(out, logical_not(any_inf))
+    # Make all elements where both a or b are the same inf to True
+    same_value = lax.eq(a, b)
+    same_inf = logical_and(both_inf, same_value)
+    out = logical_or(out, same_inf)
+
+    # Make all elements where either a or b is NaN to False
+    a_nan = isnan(a)
+    b_nan = isnan(b)
+    any_nan = logical_or(a_nan, b_nan)
+    out = logical_and(out, logical_not(any_nan))
+    if equal_nan:
+      # Make all elements where both a and b is NaN to True
+      both_nan = logical_and(a_nan, b_nan)
+      out = logical_or(out, both_nan)
     return _maybe_numpy_1_13_isclose_behavior(a, out)
   else:
     return lax.eq(a, b)
@@ -969,16 +1239,32 @@ else:
 # The `jit` on `where` exists to avoid materializing constants in cases like
 # `np.where(np.zeros(1000), 7, 4)`. In op-by-op mode, we don't want to
 # materialize the broadcast forms of scalar arguments.
-@_wraps(onp.where, update_doc=False)
 @jit
-def where(condition, x=None, y=None):
+def _where(condition, x=None, y=None):
   if x is None or y is None:
-    raise ValueError("Must use the three-argument form of where().")
-  if not issubdtype(_dtype(condition), onp.bool_):
+    raise ValueError("Either both or neither of the x and y arguments should "
+                     "be provided to jax.numpy.where, got {} and {}."
+                     .format(x, y))
+  if not issubdtype(_dtype(condition), bool_):
     condition = lax.ne(condition, zeros_like(condition))
   x, y = _promote_dtypes(x, y)
   condition, x, y = broadcast_arrays(condition, x, y)
   return lax.select(condition, x, y) if onp.size(x) else x
+
+
+_WHERE_DOC = """\
+At present, JAX does not support JIT-compilation of the single-argument form
+of :py:func:`jax.numpy.where` because its output shape is data-dependent. The
+three-argument form does not have a data-dependent shape and can be JIT-compiled
+successfully.
+"""
+
+@_wraps(onp.where, update_doc=False, lax_description=_WHERE_DOC)
+def where(condition, x=None, y=None):
+  if x is None and y is None:
+    return nonzero(asarray(condition))
+  else:
+    return _where(condition, x, y)
 
 
 @_wraps(onp.select)
@@ -988,8 +1274,9 @@ def select(condlist, choicelist, default=0):
     raise ValueError(msg.format(len(condlist), len(choicelist)))
   if len(condlist) == 0:
     raise ValueError("condlist must be non-empty")
-
-  output = default
+  choices = _promote_dtypes(default, *choicelist)
+  choicelist = choices[1:]
+  output = choices[0]
   for cond, choice in zip(condlist[::-1], choicelist[::-1]):
     output = where(cond, choice, output)
   return output
@@ -1027,10 +1314,18 @@ def broadcast_to(arr, shape):
 @_wraps(onp.split)
 def split(ary, indices_or_sections, axis=0):
   dummy_val = onp.broadcast_to(0, ary.shape)  # zero strides
+  if isinstance(indices_or_sections, (tuple, list) + _arraylike_types):
+    indices_or_sections = [core.concrete_or_error(int, i_s, "in jax.numpy.split argument 1")
+                           for i_s in indices_or_sections]
+  else:
+    indices_or_sections = core.concrete_or_error(int, indices_or_sections,
+                                                 "in jax.numpy.split argument 1")
+  axis = core.concrete_or_error(int, axis, "in jax.numpy.split argument `axis`")
+
   subarrays = onp.split(dummy_val, indices_or_sections, axis)  # shapes
   split_indices = onp.cumsum([0] + [onp.shape(sub)[axis] for sub in subarrays])
   starts, ends = [0] * ndim(ary), shape(ary)
-  _subval = lambda x, i, v: lax.subvals(x, [(i, v)])
+  _subval = lambda x, i, v: subvals(x, [(i, v)])
   return [lax.slice(ary, _subval(starts, axis, start), _subval(ends, axis, end))
           for start, end in zip(split_indices[:-1], split_indices[1:])]
 
@@ -1048,7 +1343,7 @@ dsplit = _split_on_axis(onp.dsplit, axis=2)
 @_wraps(onp.clip)
 def clip(a, a_min=None, a_max=None):
   if a_min is None and a_max is None:
-    raise "At most one of a_min and a_max may be None"
+    raise ValueError("At most one of a_min and a_max may be None")
   if a_min is not None:
     if _dtype(a_min) != _dtype(a):
       a_min = lax.convert_element_type(a_min, _dtype(a))
@@ -1062,7 +1357,7 @@ def clip(a, a_min=None, a_max=None):
 
 def _dtype_info(dtype):
   """Helper function for to get dtype info needed for clipping."""
-  if issubdtype(dtype, onp.integer):
+  if issubdtype(dtype, integer):
     return iinfo(dtype)
   return finfo(dtype)
 
@@ -1191,9 +1486,9 @@ def _make_reduction(np_fun, op, init_val, preproc=None, bool_op=None,
       computation_dtype = result_dtype
     a = lax.convert_element_type(a, computation_dtype)
     result = lax.reduce(a, _reduction_init_val(a, init_val),
-                        op if computation_dtype != bool_ else bool_op, dims)
+                        op if computation_dtype != onp.bool_ else bool_op, dims)
     if keepdims:
-      shape_with_singletons = lax.subvals(shape(a), zip(dims, (1,) * len(dims)))
+      shape_with_singletons = subvals(shape(a), zip(dims, (1,) * len(dims)))
       result = lax.reshape(result, shape_with_singletons)
     return lax.convert_element_type(result, dtype or result_dtype)
 
@@ -1216,7 +1511,7 @@ def _reduction_init_val(a, init_val):
   try:
     return onp.array(init_val, dtype=a_dtype)
   except OverflowError:
-    assert issubdtype(a_dtype, onp.integer)
+    assert issubdtype(a_dtype, integer)
     sign, info = onp.sign(init_val), iinfo(a_dtype)
     return onp.array(info.min if sign < 0 else info.max, dtype=a_dtype)
 
@@ -1242,8 +1537,7 @@ def mean(a, axis=None, dtype=None, out=None, keepdims=False):
   else:
     normalizer = onp.prod(onp.take(shape(a), axis))
   if dtype is None:
-    if (issubdtype(_dtype(a), onp.bool_) or
-        issubdtype(_dtype(a), onp.integer)):
+    if issubdtype(_dtype(a), bool_) or issubdtype(_dtype(a), integer):
       dtype = float_
     else:
       dtype = _dtype(a)
@@ -1361,6 +1655,24 @@ def count_nonzero(a, axis=None):
              dtype=dtypes.canonicalize_dtype(onp.int_))
 
 
+_NONZERO_DOC = """\
+At present, JAX does not support JIT-compilation of :py:func:`jax.numpy.nonzero`
+because its output shape is data-dependent.
+"""
+
+@_wraps(onp.nonzero, lax_description=_NONZERO_DOC)
+def nonzero(a):
+  # Note: this function cannot be jitted because its output has a dynamic
+  # shape.
+  a = atleast_1d(a)
+  dims = shape(a)
+  ndims = len(dims)
+  ds = [lax.broadcasted_iota(int_, dims + (1,), i) for i in range(ndims)]
+  d = concatenate(ds, axis=-1)
+  indexes = d[a != 0]
+  return tuple(indexes[..., i] for i in range(ndims))
+
+
 def _make_nan_reduction(onp_reduction, np_reduction, init_val, nan_if_all_nan):
   @_wraps(onp_reduction)
   def nan_reduction(a, axis=None, out=None, keepdims=False, **kwargs):
@@ -1383,8 +1695,7 @@ nanprod = _make_nan_reduction(onp.nanprod, prod, 1, nan_if_all_nan=False)
 def nanmean(a, axis=None, dtype=None, out=None, keepdims=False):
   if out is not None:
     raise ValueError("nanmean does not support the `out` argument.")
-  if (issubdtype(_dtype(a), onp.bool_) or
-      issubdtype(_dtype(a), onp.integer)):
+  if issubdtype(_dtype(a), bool_) or issubdtype(_dtype(a), integer):
     return mean(a, axis, dtype, out, keepdims)
   if dtype is None:
     dtype = _dtype(a)
@@ -1394,8 +1705,8 @@ def nanmean(a, axis=None, dtype=None, out=None, keepdims=False):
   td = lax.div(nansum(a, axis, dtype=dtype, keepdims=keepdims), normalizer)
   return td
 
-def _make_cumulative_reduction(onp_reduction, window_reduce, init_val,
-                               squash_nan=False):
+
+def _make_cumulative_reduction(onp_reduction, reduction, squash_nan=False):
   # We want to allow XLA to fuse the pad and reduce-window operators to
   # avoid materializing the padded output.
   # Consider removing `jit` once again if reduce-window is generalized to
@@ -1417,40 +1728,29 @@ def _make_cumulative_reduction(onp_reduction, window_reduce, init_val,
               axis, num_dims))
 
     if squash_nan:
-      a = where(isnan(a), _constant_like(a, init_val), a)
+      a = where(isnan(a), _constant_like(a, unit), a)
 
+    if not dtype and _dtype(a) == bool_:
+      dtype = int_
     if dtype:
       a = lax.convert_element_type(a, dtype)
 
-    if a_shape[axis] == 0:
-      return a
-
-    padding = [(0, 0, 0)] * num_dims
-    padding[axis] = (a_shape[axis] - 1, 0, 0)
-    a = lax.pad(a, _constant_like(a, init_val), padding)
-    strides = [1] * num_dims
-    window_dims = [1] * num_dims
-    window_dims[axis] = a_shape[axis]
-    return window_reduce(
-       a, window_dims, strides, xla_client.PaddingType.VALID)
+    return reduction(a, axis)
 
   @_wraps(onp_reduction)
   def cumulative_reduction(a, axis=None, dtype=None):
     # jit doesn't support kwargs as static_args.
     return _cumulative_reduction(a, axis, dtype)
-
   return cumulative_reduction
 
 
-cumsum = _make_cumulative_reduction(
-  onp.cumsum, lax._reduce_window_sum, 0, squash_nan=False)
-cumprod = _make_cumulative_reduction(
-  onp.cumprod, lax._reduce_window_prod, 1, squash_nan=False)
+cumsum = _make_cumulative_reduction(onp.cumsum, lax.cumsum, squash_nan=False)
+cumprod = _make_cumulative_reduction(onp.cumprod, lax.cumprod, squash_nan=False)
 cumproduct = cumprod
-nancumsum = _make_cumulative_reduction(
-  onp.nancumsum, lax._reduce_window_sum, 0, squash_nan=True)
-nancumprod = _make_cumulative_reduction(
-  onp.nancumprod, lax._reduce_window_prod, 1, squash_nan=True)
+nancumsum = _make_cumulative_reduction(onp.nancumsum, lax.cumsum,
+                                       squash_nan=True)
+nancumprod = _make_cumulative_reduction(onp.nancumprod, lax.cumprod,
+                                        squash_nan=True)
 
 
 ### Array-creation functions
@@ -1459,6 +1759,91 @@ def _check_no_padding(axis_padding, mode):
   if (axis_padding[0] > 0 or axis_padding[1] > 0):
     msg = "Cannot apply '{}' padding to empty axis"
     raise ValueError(msg.format(mode))
+
+
+def _pad_constant(array, pad_width, constant_values):
+  nd = ndim(array)
+  constant_values = broadcast_to(asarray(constant_values), (nd, 2))
+  constant_values = lax.convert_element_type(constant_values, array.dtype)
+  for i in range(nd):
+    widths = [(0, 0, 0)] * nd
+    widths[i] = (pad_width[i, 0], 0, 0)
+    array = lax.pad(array, constant_values[i, 0], widths)
+    widths[i] = (0, pad_width[i, 1], 0)
+    array = lax.pad(array, constant_values[i, 1], widths)
+  return array
+
+
+def _pad_wrap(array, pad_width):
+  for i in range(ndim(array)):
+    if array.shape[i] == 0:
+      _check_no_padding(pad_width[i], "wrap")
+      continue
+    size = array.shape[i]
+    repeats, (left_remainder, right_remainder) = _divmod(pad_width[i], size)
+    total_repeats = repeats.sum() + 1
+    parts = []
+    if left_remainder:
+      parts += [lax.slice_in_dim(array, size - left_remainder, size, axis=i)]
+    parts += total_repeats * [array]
+    if right_remainder:
+      parts += [lax.slice_in_dim(array, 0, right_remainder, axis=i)]
+    array = lax.concatenate(parts, dimension=i)
+  return array
+
+
+def _pad_symmetric_or_reflect(array, pad_width, mode):
+  assert mode in ("symmetric", "reflect")
+
+  for i in range(ndim(array)):
+    if array.shape[i] == 0:
+      _check_no_padding(pad_width[i], mode)
+      continue
+
+    n = array.shape[i]
+    rarray = lax.rev(array, dimensions=(i,))
+    offset = 1 if (mode == "reflect" and n > 1) else 0
+
+    def build_padding(padding, forward):
+      xs = []
+      delta = n - offset
+      while padding > delta:
+        padding -= delta
+        p = array if forward else rarray
+        xs.append(lax.slice_in_dim(p, offset, n, axis=i))
+        forward = not forward
+      if padding > 0:
+        x = lax.slice_in_dim(array if forward else rarray, offset,
+                             padding + offset, axis=i)
+        xs.append(x)
+      return xs
+
+    parts = reversed(build_padding(pad_width[i, 0], forward=True))
+    parts = [lax.rev(x, dimensions=(i,)) for x in parts]
+    parts += [array]
+    parts += build_padding(pad_width[i, 1], forward=False)
+    array = lax.concatenate(parts, dimension=i)
+  return array
+
+
+def _pad_edge(array, pad_width):
+  nd = ndim(array)
+  for i in range(nd):
+    if array.shape[i] == 0:
+      _check_no_padding(pad_width[i], mode)
+      continue
+
+    n = array.shape[i]
+    npad_before, npad_after = pad_width[i]
+
+    edge_before = lax.slice_in_dim(array, 0, 1, axis=i)
+    pad_before = repeat(edge_before, npad_before, axis=i)
+
+    edge_after = lax.slice_in_dim(array, n-1, n, axis=i)
+    pad_after = repeat(edge_after, npad_after, axis=i)
+
+    array = lax.concatenate([pad_before, array, pad_after], dimension=i)
+  return array
 
 
 @partial(jit, static_argnums=(1, 2))
@@ -1470,67 +1855,25 @@ def _pad(array, pad_width, mode, constant_values):
     raise ValueError("index can't contain negative values")
 
   if mode == "constant":
-    constant_values = broadcast_to(asarray(constant_values), (nd, 2))
-    constant_values = lax.convert_element_type(constant_values, array.dtype)
-    for i in xrange(nd):
-      widths = [(0, 0, 0)] * nd
-      widths[i] = (pad_width[i, 0], 0, 0)
-      array = lax.pad(array, constant_values[i, 0], widths)
-      widths[i] = (0, pad_width[i, 1], 0)
-      array = lax.pad(array, constant_values[i, 1], widths)
-    return array
+    return _pad_constant(array, pad_width, constant_values)
+
   elif mode == "wrap":
-    for i in xrange(nd):
-      if array.shape[i] == 0:
-        _check_no_padding(pad_width[i], mode)
-        continue
-      size = array.shape[i]
-      repeats, (left_remainder, right_remainder) = _divmod(pad_width[i], size)
-      total_repeats = repeats.sum() + 1
-      parts = []
-      if left_remainder:
-        parts += [lax.slice_in_dim(array, size - left_remainder, size, axis=i)]
-      parts += total_repeats * [array]
-      if right_remainder:
-        parts += [lax.slice_in_dim(array, 0, right_remainder, axis=i)]
-      array = lax.concatenate(parts, dimension=i)
-    return array
+    return _pad_wrap(array, pad_width)
+
   elif mode in ("symmetric", "reflect"):
-    for i in xrange(nd):
-      if array.shape[i] == 0:
-        _check_no_padding(pad_width[i], mode)
-        continue
+    return _pad_symmetric_or_reflect(array, pad_width, mode)
 
-      n = array.shape[i]
-      rarray = lax.rev(array, dimensions=(i,))
-      offset = 1 if (mode == "reflect" and n > 1) else 0
+  elif mode == "edge":
+    return _pad_edge(array, pad_width)
 
-      def build_padding(padding, forward):
-        xs = []
-        delta = n - offset
-        while padding > delta:
-          padding -= delta
-          p = array if forward else rarray
-          xs.append(lax.slice_in_dim(p, offset, n, axis=i))
-          forward = not forward
-        if padding > 0:
-          x = lax.slice_in_dim(array if forward else rarray, offset,
-                               padding + offset, axis=i)
-          xs.append(x)
-        return xs
-
-      parts = reversed(build_padding(pad_width[i, 0], forward=True))
-      parts = [lax.rev(x, dimensions=(i,)) for x in parts]
-      parts += [array]
-      parts += build_padding(pad_width[i, 1], forward=False)
-      array = lax.concatenate(parts, dimension=i)
-    return array
   else:
     msg = "Unimplemented padding mode '{}' for np.pad."
     raise NotImplementedError(msg.format(mode))
 
 @_wraps(onp.pad)
 def pad(array, pad_width, mode='constant', constant_values=0):
+  if isinstance(pad_width, list):
+    pad_width = tuple(pad_width)
   return _pad(array, pad_width, mode, constant_values)
 
 
@@ -1571,10 +1914,13 @@ def concatenate(arrays, axis=0):
   # tree of concatenations as a workaround especially for op-by-op mode.
   # (https://github.com/google/jax/issues/653).
   k = 16
-  while len(arrays) > 1:
-    arrays = [lax.concatenate(arrays[i:i+k], axis)
-              for i in range(0, len(arrays), k)]
-  return arrays[0]
+  if len(arrays) == 1:
+    return array(arrays[0])
+  else:
+    while len(arrays) > 1:
+      arrays = [lax.concatenate(arrays[i:i+k], axis)
+                for i in range(0, len(arrays), k)]
+    return arrays[0]
 
 
 @_wraps(onp.vstack)
@@ -1605,6 +1951,33 @@ def column_stack(tup):
       arr = arr.reshape((-1, 1))
     arrays.append(arr)
   return concatenate(arrays, 1)
+
+
+def _atleast_nd(x, n):
+  m = ndim(x)
+  return lax.broadcast(x, (1,) * (n - m)) if m < n else x
+
+def _block(xs):
+  if isinstance(xs, tuple):
+    raise ValueError("jax.numpy.block does not allow tuples, got {}"
+                     .format(xs))
+  elif isinstance(xs, list):
+    if len(xs) == 0:
+      raise ValueError("jax.numpy.block does not allow empty list arguments")
+    xs, depths = unzip2([_block(x) for x in xs])
+    if _any(d != depths[0] for d in depths[1:]):
+      raise ValueError("Mismatched list depths in jax.numpy.block")
+    rank = _max(depths[0], _max(ndim(x) for x in xs))
+    xs = [_atleast_nd(x, rank) for x in xs]
+    return concatenate(xs, axis=-depths[0]), depths[0] + 1
+  else:
+    return asarray(xs), 1
+
+@_wraps(onp.block)
+@jit
+def block(arrays):
+  out, _ = _block(arrays)
+  return out
 
 
 @_wraps(onp.atleast_1d, update_doc=False)
@@ -1696,6 +2069,7 @@ def ones_like(x, dtype=None):
 @_wraps(onp.full)
 def full(shape, fill_value, dtype=None):
   lax._check_user_dtype_supported(dtype, "full")
+  shape = (shape,) if ndim(shape) == 0 else shape
   return lax.full(shape, fill_value, dtype)
 
 
@@ -1711,7 +2085,7 @@ def zeros(shape, dtype=None):
     raise TypeError("expected sequence object with len >= 0 or a single integer")
   lax._check_user_dtype_supported(dtype, "zeros")
   dtype = float_ if dtype is None else dtype
-  shape = (shape,) if isscalar(shape) else shape
+  shape = (shape,) if ndim(shape) == 0 else shape
   return lax.full(shape, 0, dtype)
 
 @_wraps(onp.ones)
@@ -1720,7 +2094,7 @@ def ones(shape, dtype=None):
     raise TypeError("expected sequence object with len >= 0 or a single integer")
   lax._check_user_dtype_supported(dtype, "ones")
   dtype = float_ if dtype is None else dtype
-  shape = (shape,) if isscalar(shape) else shape
+  shape = (shape,) if ndim(shape) == 0 else shape
   return lax.full(shape, 1, dtype)
 
 
@@ -1739,23 +2113,20 @@ empty = zeros
 
 
 @_wraps(onp.eye)
-def eye(N, M=None, k=None, dtype=None):
+def eye(N, M=None, k=0, dtype=None):
   lax._check_user_dtype_supported(dtype, "eye")
   dtype = float_ if dtype is None else dtype
   M = N if M is None else M
+  k = int(k)
   if N < 0 or M < 0:
     msg = "negative dimensions are not allowed, got {} and {}"
     raise ValueError(msg.format(N, M))
-  if k is None:
-    return lax.broadcasted_eye(dtype, (N, M), (0, 1))
-  else:
+  if k is not None:
     k_dtype = _dtype(k)
-    if not issubdtype(k_dtype, onp.integer):
+    if not issubdtype(k_dtype, integer):
       msg = "eye argument `k` must be of integer dtype, got {}"
       raise TypeError(msg.format(k_dtype))
-    rows = k + lax.broadcasted_iota(k_dtype, (N, M), 0)
-    cols = lax.broadcasted_iota(k_dtype, (N, M), 1)
-    return lax.convert_element_type(lax.eq(rows, cols), dtype)
+  return lax._eye(dtype, (N, M), k)
 
 
 @_wraps(onp.identity)
@@ -1767,16 +2138,11 @@ def identity(n, dtype=None):
 @_wraps(onp.arange)
 def arange(start, stop=None, step=None, dtype=None):
   lax._check_user_dtype_supported(dtype, "arange")
-  # If called like np.arange(N), we create a lazy lax._IotaConstant.
   if stop is None and step is None:
     dtype = dtype or _dtype(start)
-    if issubdtype(dtype, onp.integer):
-      return lax.iota(dtype, start)  # avoids materializing
-
-  # Fall back to instantiating an ndarray in host memory
-  dtype = dtype or result_type(
-    *(x for x in (start, stop, step) if x is not None))
-  return onp.arange(start, stop=stop, step=step, dtype=dtype)
+    return lax.iota(dtype, start)  # avoids materializing
+  else:
+    return array(onp.arange(start, stop=stop, step=step, dtype=dtype))
 
 
 def _wrap_numpy_nullary_function(f):
@@ -1812,7 +2178,7 @@ def linspace(start, stop, num=50, endpoint=True, retstep=False, dtype=None,
            reshape(lax.iota(dt, num), iota_shape) *
            reshape(delta, bounds_shape))
   elif num == 1:
-    delta = nan
+    delta = nan if endpoint else lax.convert_element_type(stop - start, dt)
     out = reshape(broadcast_start, bounds_shape)
   else: # num == 0 degenerate case, match onp behavior
     empty_shape = list(lax.broadcast_shapes(shape(start), shape(stop)))
@@ -2000,13 +2366,7 @@ def tri(N, M=None, k=0, dtype=None):
   lax._check_user_dtype_supported(dtype, "tri")
   M = M if M is not None else N
   dtype = dtype or float32
-  x = arange(N, dtype=int32)
-  y = arange(M, dtype=int32)
-  mask = lax.ge(
-      (lax.broadcast_in_dim(x, shape=(N, M), broadcast_dimensions=(0,)) +
-       int32(k)),
-      lax.broadcast(y, [N]))
-  return lax.convert_element_type(mask, dtype)
+  return lax._tri(dtype, (N, M), k)
 
 
 @_wraps(onp.tril)
@@ -2061,11 +2421,19 @@ def _wrap_indices_function(f):
     return tuple(asarray(x) for x in f(*args, **kwargs))
   return wrapper
 
-diag_indices = _wrap_indices_function(onp.diag_indices)
 tril_indices = _wrap_indices_function(onp.tril_indices)
 triu_indices = _wrap_indices_function(onp.triu_indices)
 mask_indices = _wrap_indices_function(onp.mask_indices)
 
+@_wraps(onp.diag_indices)
+def diag_indices(n, ndim=2):
+  if n < 0:
+    raise ValueError("n argument to diag_indices must be nonnegative, got {}"
+                     .format(n))
+  if ndim < 0:
+    raise ValueError("ndim argument to diag_indices must be nonnegative, got {}"
+                     .format(ndim))
+  return (lax.iota(int_, n),) * ndim
 
 @_wraps(onp.diagonal)
 def diagonal(a, offset=0, axis1=0, axis2=1):
@@ -2129,15 +2497,8 @@ def append(arr, values, axis=None):
 ### Tensor contraction operations
 
 
-_PRECISION_DOC = """\
-In addition to the original NumPy arguments listed below, also supports
-``precision`` for extra control over matrix-multiplication precision
-on supported devices. See :py:func:`jax.lax.dot` for details.
-"""
-
-
 @_wraps(onp.dot, lax_description=_PRECISION_DOC)
-def dot(a, b, precision=None):  # pylint: disable=missing-docstring
+def dot(a, b, *, precision=None):  # pylint: disable=missing-docstring
   _check_arraylike("dot", a, b)
   a, b = _promote_dtypes(a, b)
   a_ndim, b_ndim = ndim(a), ndim(b)
@@ -2155,7 +2516,7 @@ def dot(a, b, precision=None):  # pylint: disable=missing-docstring
 
 
 @_wraps(onp.matmul, lax_description=_PRECISION_DOC)
-def matmul(a, b, precision=None):  # pylint: disable=missing-docstring
+def matmul(a, b, *, precision=None):  # pylint: disable=missing-docstring
   _check_arraylike("matmul", a, b)
   a_is_vec, b_is_vec = (ndim(a) == 1), (ndim(b) == 1)
   a = lax.reshape(a, (1,) + shape(a)) if a_is_vec else a
@@ -2179,26 +2540,23 @@ def matmul(a, b, precision=None):  # pylint: disable=missing-docstring
 
 
 @_wraps(onp.vdot, lax_description=_PRECISION_DOC)
-def vdot(a, b, precision=None):
-  if issubdtype(_dtype(a), onp.complexfloating):
+def vdot(a, b, *, precision=None):
+  if issubdtype(_dtype(a), complexfloating):
     a = conj(a)
   return dot(a.ravel(), b.ravel(), precision=precision)
 
 
 @_wraps(onp.tensordot, lax_description=_PRECISION_DOC)
-def tensordot(a, b, axes=2, precision=None):
+def tensordot(a, b, axes=2, *, precision=None):
   _check_arraylike("tensordot", a, b)
   a_ndim = ndim(a)
   b_ndim = ndim(b)
-  if a_ndim < 1 or b_ndim < 1:
-    msg = "tensordot requires a.ndim and b.dim to be at least 1, got {} and {}."
-    raise TypeError(msg.format(ndim(a), ndim(b)))
 
   a, b = _promote_dtypes(a, b)
   if type(axes) is int:
     if axes > _min(a_ndim, b_ndim):
       msg = "Number of tensordot axes (axes {}) exceeds input ranks ({} and {})"
-      raise msg.format(axes, a.shape, b.shape)
+      raise TypeError(msg.format(axes, a.shape, b.shape))
     contracting_dims = tuple(range(a_ndim - axes, a_ndim)), tuple(range(axes))
   elif type(axes) in (list, tuple) and len(axes) == 2:
     ax1, ax2 = axes
@@ -2211,6 +2569,9 @@ def tensordot(a, b, axes=2, precision=None):
         raise TypeError(msg.format(ax1, ax2))
       contracting_dims = (tuple(_canonicalize_axis(i, a_ndim) for i in ax1),
                           tuple(_canonicalize_axis(i, b_ndim) for i in ax2))
+    else:
+        msg = "tensordot requires both axes lists to be either ints, tuples or lists, got {} and {}"
+        raise TypeError(msg.format(ax1, ax2))
   else:
     msg = ("tensordot axes argument must be an int, a pair of ints, or a pair "
            "of lists/tuples of ints.")
@@ -2221,7 +2582,7 @@ def tensordot(a, b, axes=2, precision=None):
 
 @_wraps(onp.einsum, lax_description=_PRECISION_DOC)
 def einsum(*operands, **kwargs):
-  optimize = kwargs.pop('optimize', 'auto')
+  optimize = kwargs.pop('optimize', True)
   optimize = 'greedy' if optimize is True else optimize
   precision = kwargs.pop('precision', None)
   if kwargs:
@@ -2239,23 +2600,28 @@ def einsum_path(subscripts, *operands, **kwargs):
   # using einsum_call=True here is an internal api for opt_einsum
   return opt_einsum.contract_path(subscripts, *operands, optimize=optimize)
 
+def _removechars(s, chars):
+  return s.translate(str.maketrans(dict.fromkeys(chars)))
+
 @partial(jit, static_argnums=(1, 2))
 def _einsum(operands, contractions, precision):
   operands = list(_promote_dtypes(*operands))
-  sum = lambda x, axes: lax.reduce(x, onp.array(0, x.dtype), lax.add, axes)
+  def sum(x, axes):
+    return lax.reduce(x, onp.array(0, x.dtype),
+                      lax.add if x.dtype != bool_ else lax.bitwise_or, axes)
 
   def sum_uniques(operand, names, uniques):
     if uniques:
       axes = [names.index(name) for name in uniques]
       operand = sum(operand, axes)
-      names = removechars(names, uniques)
+      names = _removechars(names, uniques)
     return operand, names
 
   def sum_repeats(operand, names, counts, keep_names):
     for name, count in counts.items():
       if count > 1:
         axes = [i for i, n in enumerate(names) if n == name]
-        eye = lax.broadcasted_eye(operand.dtype, operand.shape, axes)
+        eye = lax._delta(operand.dtype, operand.shape, axes)
         if name not in keep_names:
           operand = sum(operand * eye, axes)
           names = names.replace(name, '')
@@ -2263,6 +2629,17 @@ def _einsum(operands, contractions, precision):
           operand = sum(operand * eye, axes[:-1])
           names = names.replace(name, '', count - 1)
     return operand, names
+
+  def filter_singleton_dims(operand, names, other_shape, other_names):
+    s = shape(operand)
+    new_shape = []
+    new_names = []
+    for i, d in enumerate(names):
+      other_i = other_names.find(d)
+      if s[i] != 1 or other_i == -1 or other_shape[other_i] == 1:
+        new_shape.append(s[i])
+        new_names.append(d)
+    return reshape(operand, tuple(new_shape)), "".join(new_names)
 
   for operand_indices, contracted_names, einstr in contractions:
     input_str, result_names = einstr.split('->')
@@ -2284,8 +2661,17 @@ def _einsum(operands, contractions, precision):
 
     elif len(operand_indices) == 2:
       lhs, rhs = map(operands.pop, operand_indices)
-      lhs_counts, rhs_counts = map(collections.Counter, input_names)
       lhs_names, rhs_names = input_names
+
+      # handle cases where one side of a contracting or batch dimension is 1
+      # but its counterpart is not.
+      lhs, lhs_names = filter_singleton_dims(lhs, lhs_names, shape(rhs),
+                                             rhs_names)
+      rhs, rhs_names = filter_singleton_dims(rhs, rhs_names, shape(lhs),
+                                             lhs_names)
+
+      lhs_counts = collections.Counter(lhs_names)
+      rhs_counts = collections.Counter(rhs_names)
 
       # sum out unique contracted indices in lhs and rhs
       lhs_uniques = [name for name in contracted_names
@@ -2304,14 +2690,16 @@ def _einsum(operands, contractions, precision):
 
       contracted_names = contracted_names & (set(lhs_names) | set(rhs_names))
       batch_names = (set(lhs_names) & set(rhs_names)) - contracted_names
+
       lhs_batch, rhs_batch = unzip2((lhs_names.find(n), rhs_names.find(n))
                                     for n in batch_names)
 
       # NOTE(mattjj): this can fail non-deterministically in python3, maybe
       # due to opt_einsum
-      assert _all(name in lhs_names and name in rhs_names and
-                  lhs.shape[lhs_names.index(name)] == rhs.shape[rhs_names.index(name)]
-                  for name in contracted_names)
+      assert _all(
+        name in lhs_names and name in rhs_names and
+        lhs.shape[lhs_names.index(name)] == rhs.shape[rhs_names.index(name)]
+        for name in contracted_names)
 
       # move batch dims to the front (required by lax.dot_general, and easier)
       batch_dims = tuple(range(len(batch_names)))
@@ -2333,8 +2721,8 @@ def _einsum(operands, contractions, precision):
       dimension_numbers = [(lhs_cont, rhs_cont), (bdims, bdims)]
       operand = lax.dot_general(lhs, rhs, dimension_numbers, precision)
       deleted_names = batch_names + ''.join(contracted_names)
-      names = (batch_names + removechars(lhs_names, deleted_names)
-               + removechars(rhs_names, deleted_names))
+      names = (batch_names + _removechars(lhs_names, deleted_names)
+               + _removechars(rhs_names, deleted_names))
     else:
       raise NotImplementedError  # if this is actually reachable, open an issue!
 
@@ -2359,7 +2747,7 @@ def _movechars(s, src, dst):
 
 
 @_wraps(onp.inner, lax_description=_PRECISION_DOC)
-def inner(a, b, precision=None):
+def inner(a, b, *, precision=None):
   if ndim(a) == 0 or ndim(b) == 0:
     return a * b
   return tensordot(a, b, (-1, -1), precision=precision)
@@ -2439,7 +2827,22 @@ def argmax(a, axis=None):
   if axis is None:
     a = ravel(a)
     axis = 0
-  return _argminmax(max, a, axis)
+  return _argminmax("argmax", max, a, axis)
+
+
+_NANARG_DOC = """\
+Warning: jax.numpy.arg{} returns -1 for all-NaN slices and does not raise
+an error.
+"""
+
+@_wraps(onp.nanargmax, lax_description=_NANARG_DOC.format("max"))
+def nanargmax(a, axis=None):
+  if not issubdtype(_dtype(a), inexact):
+    return argmax(a, axis=axis)
+  nan_mask = isnan(a)
+  a = where(nan_mask, -inf, a)
+  res = argmax(a, axis=axis)
+  return where(all(nan_mask, axis=axis), -1, res)
 
 
 @_wraps(onp.argmin)
@@ -2447,11 +2850,23 @@ def argmin(a, axis=None):
   if axis is None:
     a = ravel(a)
     axis = 0
-  return _argminmax(min, a, axis)
+  return _argminmax("argmin", min, a, axis)
+
+
+@_wraps(onp.nanargmin, lax_description=_NANARG_DOC.format("min"))
+def nanargmin(a, axis=None):
+  if not issubdtype(_dtype(a), inexact):
+    return argmin(a, axis=axis)
+  nan_mask = isnan(a)
+  a = where(nan_mask, inf, a)
+  res = argmin(a, axis=axis)
+  return where(all(nan_mask, axis=axis), -1, res)
 
 
 # TODO(mattjj): redo this lowering with a call to variadic lax.reduce
-def _argminmax(op, a, axis):
+def _argminmax(name, op, a, axis):
+  if a.shape[axis] == 0:
+    raise ValueError("attempt to get {} of an empty sequence".format(name))
   shape = [1] * a.ndim
   shape[axis] = a.shape[axis]
   idxs = lax.tie_in(a, arange(a.shape[axis])).reshape(shape)
@@ -2490,8 +2905,13 @@ def argsort(a, axis=-1, kind='quicksort', order=None):
     return perm
 
 
-@_wraps(onp.roll)
-def roll(a, shift, axis=None):
+@_wraps(onp.msort)
+def msort(a):
+  return sort(a, axis=0)
+
+
+@partial(jit, static_argnums=(2,))
+def _roll(a, shift, axis):
   a = asarray(a)
   a_shape = shape(a)
   if axis is None:
@@ -2504,8 +2924,6 @@ def roll(a, shift, axis=None):
   if len(b_shape) != 1:
     msg = "'shift' and 'axis' arguments to roll must be scalars or 1D arrays"
     raise ValueError(msg)
-  if b_shape[0] > a_ndim:
-    raise ValueError("More shifts/axes than dimensions of input to roll.")
 
   for x, i in zip(broadcast_to(shift, b_shape),
                   onp.broadcast_to(axis, b_shape)):
@@ -2514,6 +2932,71 @@ def roll(a, shift, axis=None):
     a = lax.concatenate((a, a), i)
     a = lax.dynamic_slice_in_dim(a, a_shape[i] - x, a_shape[i], axis=i)
   return a
+
+
+@_wraps(onp.roll)
+def roll(a, shift, axis=None):
+  return _roll(a, shift, axis)
+
+
+@_wraps(onp.rollaxis)
+def rollaxis(a, axis, start=0):
+  a_ndim = ndim(a)
+  if not (-a_ndim <= axis < a_ndim):
+    raise ValueError(f"axis={axis} is out of bounds for array of dimension {a_ndim}")
+  if not (-a_ndim <= start <= a_ndim):
+    raise ValueError(f"start={start} must satisfy {-a_ndim}<=start<={a_ndim}")
+  if start < 0:
+    start += a_ndim
+  if axis < 0:
+    axis += a_ndim
+  if start > axis:
+    start -= 1
+  return moveaxis(a, axis, start)
+
+
+@_wraps(onp.packbits)
+def packbits(a, axis=None, bitorder='big'):
+  a = asarray(a)
+  if not (issubdtype(dtype(a), integer) or issubdtype(dtype(a), bool_)):
+    raise TypeError('Expected an input array of integer or boolean data type')
+  if bitorder not in ['little', 'big']:
+    raise ValueError("'order' must be either 'little' or 'big'")
+  a = (a > 0).astype('uint8')
+  bits = arange(8, dtype='uint8')
+  if bitorder == 'big':
+    bits = bits[::-1]
+  if axis is None:
+    a = ravel(a)
+    axis = 0
+  a = swapaxes(a, axis, -1)
+
+  remainder = a.shape[-1] % 8
+  if remainder:
+    a = pad(a, (a.ndim - 1) * [(0, 0)] + [(0, 8 - remainder)])
+
+  a = a.reshape(a.shape[:-1] + (a.shape[-1] // 8, 8))
+  packed = (a << bits).sum(-1).astype('uint8')
+  return swapaxes(packed, axis, -1)
+
+
+@_wraps(onp.unpackbits)
+def unpackbits(a, axis=None, count=None, bitorder='big'):
+  a = asarray(a)
+  if dtype(a) != uint8:
+    raise TypeError("Expected an input array of unsigned byte data type")
+  if bitorder not in ['little', 'big']:
+    raise ValueError("'order' must be either 'little' or 'big'")
+  bits = asarray(1) << arange(8, dtype='uint8')
+  if bitorder == 'big':
+    bits = bits[::-1]
+  if axis is None:
+    a = a.ravel()
+    axis = 0
+  a = swapaxes(a, axis, -1)
+  unpacked = ((a[..., None] & bits) > 0).astype('uint8')
+  unpacked = unpacked.reshape(unpacked.shape[:-2] + (-1,))[..., :count]
+  return swapaxes(unpacked, axis, -1)
 
 
 @_wraps(onp.take)
@@ -2628,6 +3111,76 @@ def _take_along_axis(arr, indices, axis):
 def take_along_axis(arr, indices, axis):
   return _take_along_axis(arr, indices, axis)
 
+
+### SetOps
+
+@partial(jit, static_argnums=1)
+def _unique1d_sorted_mask(ar, optional_indices=False):
+  """
+  Helper function for unique which is jit-able
+  """
+
+  ar = asarray(ar).flatten()
+
+  if optional_indices:
+    perm = ar.argsort()
+    aux = ar[perm]
+  else:
+    aux = ar.sort()
+
+  mask = empty(aux.shape, dtype=bool_)
+  mask = ops.index_update(mask, ops.index[:1], True)
+  mask = ops.index_update(mask, ops.index[1:], aux[1:] != aux[:-1])
+
+  if optional_indices:
+    return aux, mask, perm
+  else:
+    return aux, mask
+
+def _unique1d(ar, return_index=False, return_inverse=False,
+              return_counts=False):
+  """
+  Find the unique elements of an array, ignoring shape.
+  """
+
+  optional_indices = return_index or return_inverse
+
+  if optional_indices:
+    aux, mask, perm = _unique1d_sorted_mask(ar, optional_indices)
+  else:
+    aux, mask = _unique1d_sorted_mask(ar, optional_indices)
+
+  ret = (aux[mask],)
+  if return_index:
+    ret += (perm[mask],)
+  if return_inverse:
+    imask = cumsum(mask) - 1
+    inv_idx = zeros(mask.shape, dtype=int_)
+    inv_idx = ops.index_update(inv_idx, perm, imask)
+    ret += (inv_idx,)
+  if return_counts:
+    idx = concatenate(nonzero(mask) + (array([mask.size]),))
+    ret += (diff(idx),)
+  return ret
+
+@_wraps(onp.unique)
+def unique(ar, return_index=False, return_inverse=False,
+           return_counts=False, axis=None):
+
+  if iscomplexobj(ar):
+    raise NotImplementedError(
+          "np.unique is not implemented for complex valued arrays")
+
+  if axis is None:
+    ret = _unique1d(ar, return_index, return_inverse, return_counts)
+    if len(ret) == 1:
+      return ret[0]
+    else:
+      return ret
+
+  raise NotImplementedError(
+        "np.unique is not implemented for the axis argument")
+
 ### Indexing
 
 def _rewriting_take(arr, idx):
@@ -2646,9 +3199,13 @@ def _gather(arr, treedef, static_idx, dynamic_idx):
   indexer = _index_to_gather(shape(arr), idx)  # shared with _scatter_update
   y = arr
 
-  # We avoid generating a gather when indexer.gather_indices.size is empty
-  # unless indexer.slice_shape also corresponds to an empty array.
-  if indexer.gather_indices.size or not _prod(indexer.slice_shape):
+  # Avoid calling gather if the slice shape is empty, both as a fast path and to
+  # handle cases like zeros(0)[array([], int32)].
+  if _prod(indexer.slice_shape) == 0:
+    return zeros(indexer.slice_shape, dtype=y.dtype)
+
+  # We avoid generating a gather when indexer.gather_indices.size is empty.
+  if indexer.gather_indices.size:
     y = lax.gather(y, indexer.gather_indices, indexer.dnums,
                    indexer.gather_slice_shape)
 
@@ -2720,7 +3277,7 @@ def _merge_static_and_dynamic_indices(treedef, static_idx, dynamic_idx):
   return treedef.unflatten(idx)
 
 def _int(aval):
-  return not aval.shape and issubdtype(aval.dtype, onp.integer)
+  return not aval.shape and issubdtype(aval.dtype, integer)
 
 def _index_to_gather(x_shape, idx):
   # Remove ellipses and add trailing slice(None)s.
@@ -2761,7 +3318,8 @@ def _index_to_gather(x_shape, idx):
   collapsed_slice_dims = []
   start_index_map = []
 
-  gather_indices = zeros((0,), dtype=int32)
+  index_dtype = int64 if _max(x_shape, default=0) >= (1 << 31) else int32
+  gather_indices = onp.zeros((0,), dtype=index_dtype)  # use onp to save a compilation
 
   # We perform three transformations to y before the scatter op, in order:
   # First, y is broadcast to slice_shape. In general `y` only need broadcast to
@@ -2788,7 +3346,7 @@ def _index_to_gather(x_shape, idx):
       shape = advanced_indexes[0].shape
       ndim = len(shape)
       advanced_indexes = [
-        lax.convert_element_type(lax.reshape(a, shape + (1,)), int32)
+        lax.convert_element_type(lax.reshape(a, shape + (1,)), index_dtype)
         for a in advanced_indexes]
 
       # Broadcast gather_indices from [..., k] to [..., 1, 1, ..., 1, k].
@@ -2815,8 +3373,11 @@ def _index_to_gather(x_shape, idx):
     # Handle basic int indexes.
     if (isinstance(abstract_i, ConcreteArray) or
         isinstance(abstract_i, ShapedArray)) and _int(abstract_i):
+      if x_shape[x_axis] == 0:
+        # XLA gives error when indexing into an axis of size 0
+        raise IndexError(f"index is out of bounds for axis {x_axis} with size 0")
       i = _normalize_index(i, x_shape[x_axis])
-      i = lax.convert_element_type(i, int32)
+      i = lax.convert_element_type(i, index_dtype)
       i = broadcast_to(i, tuple(gather_indices.shape[:-1]) + (1,))
       gather_indices = concatenate((gather_indices, i), -1)
       collapsed_slice_dims.append(x_axis)
@@ -2848,7 +3409,7 @@ def _index_to_gather(x_shape, idx):
       if needs_rev:
         reversed_y_dims.append(collapsed_y_axis)
       if stride == 1:
-        i = lax.convert_element_type(start, int32)
+        i = lax.convert_element_type(start, index_dtype)
         i = broadcast_to(i, tuple(gather_indices.shape[:-1]) + (1,))
         gather_indices = concatenate((gather_indices, i), -1)
         slice_shape.append(limit - start)
@@ -2856,7 +3417,7 @@ def _index_to_gather(x_shape, idx):
         offset_dims.append(collapsed_y_axis)
         start_index_map.append(x_axis)
       else:
-        i = arange(start, limit, stride, dtype=int32)
+        i = arange(start, limit, stride, dtype=index_dtype)
         size = i.shape[0]
         slice_shape.append(size)
         gather_slice_shape.append(1)
@@ -2879,8 +3440,8 @@ def _index_to_gather(x_shape, idx):
       y_axis += 1
       x_axis += 1
     else:
-      if abstract_i and not (issubdtype(abstract_i.dtype, integer) or
-                             issubdtype(abstract_i.dtype, bool_)):
+      if (abstract_i is not None and
+          not (issubdtype(abstract_i.dtype, integer) or issubdtype(abstract_i.dtype, bool_))):
         msg = ("Indexer must have integer or boolean type, got indexer "
                "with type {} at position {}, indexer value {}")
         raise TypeError(msg.format(abstract_i.dtype.name, idx_pos, i))
@@ -2930,8 +3491,8 @@ def _expand_bool_indices(idx):
       abstract_i = core.get_aval(i)
     except TypeError:
       abstract_i = None
-    if (isinstance(abstract_i, ShapedArray) and issubdtype(abstract_i.dtype, onp.bool_)
-          or isinstance(i, list) and _all(not _shape(e) and issubdtype(_dtype(e), onp.bool_)
+    if (isinstance(abstract_i, ShapedArray) and issubdtype(abstract_i.dtype, bool_)
+          or isinstance(i, list) and _all(not _shape(e) and issubdtype(_dtype(e), bool_)
                                           for e in i)):
       if isinstance(i, list):
         i = array(i)
@@ -3025,9 +3586,10 @@ def gcd(x1, x2):
   if (not issubdtype(_dtype(x1), integer) or
       not issubdtype(_dtype(x2), integer)):
     raise ValueError("Arguments to gcd must be integers.")
-  x1, x2 = _promote_dtypes(lax.abs(x1), lax.abs(x2))
+  x1, x2 = _promote_dtypes(x1, x2)
   x1, x2 = broadcast_arrays(x1, x2)
-  gcd, _ = lax.while_loop(_gcd_cond_fn, _gcd_body_fn, (x1, x2))
+  gcd, _ = lax.while_loop(_gcd_cond_fn, _gcd_body_fn,
+                          (lax.abs(x1), lax.abs(x2)))
   return gcd
 
 
@@ -3090,7 +3652,7 @@ def cov(m, y=None, rowvar=True, bias=False, ddof=None, fweights=None,
 
 
 @_wraps(onp.corrcoef)
-def corrcoef(x, y=None, rowvar=True, bias=None, ddof=None):
+def corrcoef(x, y=None, rowvar=True):
   c = cov(x, y, rowvar)
   if len(shape(c)) == 0:
       # scalar - this should yield nan for values (nan/nan, inf/inf, 0/0), 1 otherwise
@@ -3116,12 +3678,12 @@ def quantile(a, q, axis=None, out=None, overwrite_input=False,
     msg = ("jax.numpy.quantile does not support overwrite_input=True or "
            "out != None")
     raise ValueError(msg)
-  if interpolation != "linear":
-    raise NotImplementedError("Only interpolation='linear' is implemented")
-  return _quantile(a, q, axis, keepdims)
+  if interpolation not in ["linear", "lower", "higher", "midpoint", "nearest"]:
+    raise ValueError("interpolation can only be 'linear', 'lower', 'higher', 'midpoint', or 'nearest'")
+  return _quantile(a, q, axis, interpolation, keepdims)
 
-@partial(jit, static_argnums=(2, 3))
-def _quantile(a, q, axis, keepdims):
+@partial(jit, static_argnums=(2, 3, 4))
+def _quantile(a, q, axis, interpolation, keepdims):
   a = asarray(a)
   if axis is None:
     a = ravel(a)
@@ -3150,7 +3712,7 @@ def _quantile(a, q, axis, keepdims):
   n = a_shape[axis]
   q = lax.mul(q, _constant_like(q, n - 1))
   low = lax.floor(q)
-  high = lax.add(low, _constant_like(low, 1))
+  high = lax.ceil(q)
   high_weight = lax.sub(q, low)
   low_weight = lax.sub(_constant_like(high_weight, 1), high_weight)
 
@@ -3179,9 +3741,23 @@ def _quantile(a, q, axis, keepdims):
                                       broadcast_dimensions=(0,))
     high_weight = lax.broadcast_in_dim(high_weight, high_value.shape,
                                       broadcast_dimensions=(0,))
-  return lax.convert_element_type(
-    lax.add(lax.mul(low_value.astype(q.dtype), low_weight),
-            lax.mul(high_value.astype(q.dtype), high_weight)), a.dtype)
+
+  if interpolation == "linear":
+    result = lax.add(lax.mul(low_value.astype(q.dtype), low_weight),
+                     lax.mul(high_value.astype(q.dtype), high_weight))
+  elif interpolation == "lower":
+    result = low_value
+  elif interpolation == "higher":
+    result = high_value
+  elif interpolation == "nearest":
+    pred = lax.le(high_weight, _constant_like(high_weight, 0.5))
+    result = lax.select(pred, low_value, high_value)
+  elif interpolation == "midpoint":
+    result = lax.mul(lax.add(low_value, high_value), _constant_like(low_value, 0.5))
+  else:
+    raise ValueError(f"interpolation={interpolation!r} not recognized")
+
+  return lax.convert_element_type(result, a.dtype)
 
 
 @_wraps(onp.percentile)
@@ -3196,7 +3772,7 @@ def percentile(a, q, axis=None, out=None, overwrite_input=False,
 def median(a, axis=None, out=None, overwrite_input=False, keepdims=False):
     q = 0.5
     return quantile(a, q, axis=axis, out=out, overwrite_input=overwrite_input,
-                    keepdims=keepdims)
+                    keepdims=keepdims, interpolation='midpoint')
 
 def _astype(arr, dtype):
   lax._check_user_dtype_supported(dtype, "astype")
@@ -3223,6 +3799,15 @@ for func in get_module_functions(onp):
 # operator overloads mainly just forward calls to the corresponding lax_numpy
 # functions, which can themselves handle instances from any of these classes.
 
+_scalar_types = (int, float, complex, onp.generic)
+
+def _defer_to_unrecognized_arg(binary_op):
+  # Ensure that other array types have the chance to override arithmetic.
+  def deferring_binary_op(self, other):
+    if not isinstance(other, _scalar_types + _arraylike_types + (core.Tracer,)):
+      return NotImplemented
+    return binary_op(self, other)
+  return deferring_binary_op
 
 def _swap_args(f):
   return lambda x, y: f(y, x)
@@ -3233,47 +3818,53 @@ def _unimplemented_setitem(self, i, x):
          "jax.ops.index_add instead?")
   raise TypeError(msg.format(type(self)))
 
+def _operator_round(number, ndigits=None):
+  out = round(number, decimals=ndigits or 0)
+  # If `ndigits` is None, for a builtin float round(7.5) returns an integer.
+  return out.astype(int_) if ndigits is None else out
+
 _operators = {
     "getitem": _rewriting_take,
     "setitem": _unimplemented_setitem,
     "neg": negative,
     "pos": positive,
-    "eq": equal,
-    "ne": not_equal,
-    "lt": less,
-    "le": less_equal,
-    "gt": greater,
-    "ge": greater_equal,
+    "eq": _defer_to_unrecognized_arg(equal),
+    "ne": _defer_to_unrecognized_arg(not_equal),
+    "lt": _defer_to_unrecognized_arg(less),
+    "le": _defer_to_unrecognized_arg(less_equal),
+    "gt": _defer_to_unrecognized_arg(greater),
+    "ge": _defer_to_unrecognized_arg(greater_equal),
     "abs": abs,
-    "add": add,
-    "radd": add,
-    "sub": subtract,
-    "rsub": _swap_args(subtract),
-    "mul": multiply,
-    "rmul": multiply,
-    "div": divide,
-    "rdiv": _swap_args(divide),
-    "truediv": true_divide,
-    "rtruediv": _swap_args(true_divide),
-    "floordiv": floor_divide,
-    "rfloordiv": _swap_args(floor_divide),
-    "divmod": divmod,
-    "rdivmod": _swap_args(divmod),
-    "mod": mod,
-    "rmod": _swap_args(mod),
-    "pow": power,
-    "rpow": _swap_args(power),
-    "matmul": matmul,
-    "rmatmul": _swap_args(matmul),
-    "and": bitwise_and,
-    "rand": bitwise_and,
-    "or": bitwise_or,
-    "ror": bitwise_or,
-    "xor": bitwise_xor,
-    "rxor": bitwise_xor,
+    "add": _defer_to_unrecognized_arg(add),
+    "radd": _defer_to_unrecognized_arg(add),
+    "sub": _defer_to_unrecognized_arg(subtract),
+    "rsub": _defer_to_unrecognized_arg(_swap_args(subtract)),
+    "mul": _defer_to_unrecognized_arg(multiply),
+    "rmul": _defer_to_unrecognized_arg(multiply),
+    "div": _defer_to_unrecognized_arg(divide),
+    "rdiv": _defer_to_unrecognized_arg(_swap_args(divide)),
+    "truediv": _defer_to_unrecognized_arg(true_divide),
+    "rtruediv": _defer_to_unrecognized_arg(_swap_args(true_divide)),
+    "floordiv": _defer_to_unrecognized_arg(floor_divide),
+    "rfloordiv": _defer_to_unrecognized_arg(_swap_args(floor_divide)),
+    "divmod": _defer_to_unrecognized_arg(divmod),
+    "rdivmod": _defer_to_unrecognized_arg(_swap_args(divmod)),
+    "mod": _defer_to_unrecognized_arg(mod),
+    "rmod": _defer_to_unrecognized_arg(_swap_args(mod)),
+    "pow": _defer_to_unrecognized_arg(power),
+    "rpow": _defer_to_unrecognized_arg(_swap_args(power)),
+    "matmul": _defer_to_unrecognized_arg(matmul),
+    "rmatmul": _defer_to_unrecognized_arg(_swap_args(matmul)),
+    "and": _defer_to_unrecognized_arg(bitwise_and),
+    "rand": _defer_to_unrecognized_arg(bitwise_and),
+    "or": _defer_to_unrecognized_arg(bitwise_or),
+    "ror": _defer_to_unrecognized_arg(bitwise_or),
+    "xor": _defer_to_unrecognized_arg(bitwise_xor),
+    "rxor": _defer_to_unrecognized_arg(bitwise_xor),
     "invert": bitwise_not,
-    "lshift": left_shift,
-    "rshift": right_shift,
+    "lshift": _defer_to_unrecognized_arg(left_shift),
+    "rshift": _defer_to_unrecognized_arg(right_shift),
+    "round": _operator_round,
 }
 
 # These numpy.ndarray methods are just refs to an equivalent numpy function
@@ -3313,6 +3904,7 @@ setattr(DeviceArray, "T", property(transpose))
 setattr(DeviceArray, "real", property(real))
 setattr(DeviceArray, "imag", property(imag))
 setattr(DeviceArray, "astype", _astype)
+setattr(DeviceArray, "tolist", lambda x: onp.array(x).tolist())
 
 
 # Extra methods that are handy
@@ -3329,3 +3921,115 @@ def _unstack(x):
     raise ValueError("Argument to _unstack must be non-scalar")
   return [lax.index_in_dim(x, i, keepdims=False) for i in range(x.shape[0])]
 setattr(DeviceArray, "_unstack", _unstack)
+
+
+# Syntactic sugar for scatter operations.
+class _IndexUpdateHelper:
+  # Note: this docstring will appear as the docstring for the `at` property.
+  """Indexable helper object to call indexed update functions.
+
+  The `at` property is syntactic sugar for calling the indexed update functions
+  defined in :mod:`jax.ops`, and acts as a pure equivalent of in-place
+  modificatons.
+
+  In particular:
+  - ``x = x.at[idx].set(y)`` is a pure equivalent of ``x[idx] = y``.
+  - ``x = x.at[idx].add(y)`` is a pure equivalent of ``x[idx] += y``.
+  - ``x = x.at[idx].mul(y)`` is a pure equivalent of ``x[idx] *= y``.
+  - ``x = x.at[idx].min(y)`` is a pure equivalent of
+      ``x[idx] = minimum(x[idx], y)``.
+  - ``x = x.at[idx].max(y)`` is a pure equivalent of
+      ``x[idx] = maximum(x[idx], y)``.
+  """
+  __slots__ = ("array",)
+
+  def __init__(self, array):
+    self.array = array
+
+  def __getitem__(self, index):
+    return _IndexUpdateRef(self.array, index)
+
+  def __repr__(self):
+    return f"_IndexUpdateHelper({repr(self.array)})"
+
+
+class _IndexUpdateRef:
+  """Helper object to call indexed update functions for an (advanced) index.
+
+  This object references a source array and a specific indexer into that array.
+  Methods on this object return copies of the source array that have been
+  modified at the positions specified by the indexer.
+  """
+  __slots__ = ("array", "index")
+
+  def __init__(self, array, index):
+    self.array = array
+    self.index = index
+
+  def __repr__(self):
+    return f"_IndexUpdateRef({repr(self.array)}, {repr(self.index)})"
+
+  def set(self, values):
+    """Pure equivalent of ``x[idx] = y``.
+
+    ``x.at[idx].set(y)`` is syntactic sugar for
+    ``jax.ops.index_update(x, jax.ops.index[idx], y)``, and
+    returns the value of ``x`` that would result from the NumPy-style
+    :mod:indexed assignment <numpy.doc.indexing>` ``x[idx] = y``.
+
+    See :mod:`jax.ops` for details.
+    """
+    return ops.index_update(self.array, self.index, values)
+
+  def add(self, values):
+    """Pure equivalent of ``x[idx] += y``.
+
+    ``x.at[idx].add(y)`` is syntactic sugar for
+    ``jax.ops.index_add(x, jax.ops.index[idx], y)``, and
+    returns the value of ``x`` that would result from the NumPy-style
+    :mod:indexed assignment <numpy.doc.indexing>` ``x[idx] += y``.
+
+    See :mod:`jax.ops` for details.
+    """
+    return ops.index_add(self.array, self.index, values)
+
+  def mul(self, values):
+    """Pure equivalent of ``x[idx] += y``.
+
+    ``x.at[idx].mul(y)`` is syntactic sugar for
+    ``jax.ops.index_mul(x, jax.ops.index[idx], y)``, and
+    returns the value of ``x`` that would result from the NumPy-style
+    :mod:indexed assignment <numpy.doc.indexing>` ``x[idx] *= y``.
+
+    See :mod:`jax.ops` for details.
+    """
+    return ops.index_mul(self.array, self.index, values)
+
+  def min(self, values):
+    """Pure equivalent of ``x[idx] = minimum(x[idx], y)``.
+
+    ``x.at[idx].min(y)`` is syntactic sugar for
+    ``jax.ops.index_min(x, jax.ops.index[idx], y)``, and
+    returns the value of ``x`` that would result from the NumPy-style
+    :mod:indexed assignment <numpy.doc.indexing>`
+    ``x[idx] = minimum(x[idx], y)``.
+
+    See :mod:`jax.ops` for details.
+    """
+    return ops.index_min(self.array, self.index, values)
+
+  def max(self, values):
+    """Pure equivalent of ``x[idx] = maximum(x[idx], y)``.
+
+    ``x.at[idx].max(y)`` is syntactic sugar for
+    ``jax.ops.index_max(x, jax.ops.index[idx], y)``, and
+    returns the value of ``x`` that would result from the NumPy-style
+    :mod:indexed assignment <numpy.doc.indexing>`
+    ``x[idx] = maximum(x[idx], y)``.
+
+    See :mod:`jax.ops` for details.
+    """
+    return ops.index_max(self.array, self.index, values)
+
+setattr(DeviceArray, "at", property(_IndexUpdateHelper))
+setattr(ShapedArray, "at", core.aval_property(_IndexUpdateHelper))

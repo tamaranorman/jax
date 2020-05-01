@@ -14,22 +14,20 @@
 
 """Tests for the experimental/loops."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 from absl.testing import absltest
 import numpy as onp
 import re
-import six
 
 from jax import api, lax, ops
+from jax import core
 from jax import numpy as np
 from jax import test_util as jtu
 from jax.experimental import loops
 
 from jax.config import config
 config.parse_flags_with_absl()
+
 
 class LoopsTest(jtu.JaxTestCase):
 
@@ -63,8 +61,9 @@ class LoopsTest(jtu.JaxTestCase):
     self.assertAllClose(f_expected(2.), api.jit(f_op)(2.), check_dtypes=True)
     self.assertAllClose(5., api.grad(f_op)(2.), check_dtypes=True)
     self.assertAllClose(5., api.grad(f_op)(2.), check_dtypes=True)
-    inc_batch = onp.arange(5, dtype=onp.float32)
-    self.assertAllClose(np.array([f_expected(inc) for inc in inc_batch]),
+    inc_batch = onp.arange(5, dtype=np.float_)
+    self.assertAllClose(np.array([f_expected(inc) for inc in inc_batch],
+                                 dtype=np.float_),
                         api.vmap(f_op)(inc_batch), check_dtypes=True)
 
 
@@ -143,7 +142,7 @@ class LoopsTest(jtu.JaxTestCase):
   def test_example_doc(self):
     "The example from the module docstring."
     def f_expected():
-      arr = onp.zeros(5)
+      arr = onp.zeros(5, dtype=np.float_)
       for i in range(arr.shape[0]):
         arr[i] += 2.
         if i % 2 == 0:
@@ -151,7 +150,7 @@ class LoopsTest(jtu.JaxTestCase):
       return arr
 
     def f_op_jax():
-      arr = onp.zeros(5)
+      arr = np.zeros(5)
       def loop_body(i, acc_arr):
         arr1 = ops.index_update(acc_arr, i, acc_arr[i] + 2.)
         return lax.cond(i % 2 == 0,
@@ -190,7 +189,6 @@ class LoopsTest(jtu.JaxTestCase):
 
   def test_range_locations(self):
     """Ranges have locations."""
-    if six.PY2: self.skipTest("Source location not implemented for PY2")
     with loops.Scope() as s:
       r = s.range(5)
       cr = s.cond_range(True)
@@ -229,11 +227,10 @@ class LoopsTest(jtu.JaxTestCase):
           pass
         return 0.
 
-    if six.PY3:
-      with self.assertRaisesRegex(ValueError,
-                                  re.compile(("Some ranges have exited prematurely. The innermost such range is at"
-                                             ".*s.range.555."), re.DOTALL)):
-        bad_function("break")
+    with self.assertRaisesRegex(ValueError,
+                                re.compile(("Some ranges have exited prematurely. The innermost such range is at"
+                                           ".*s.range.555."), re.DOTALL)):
+      bad_function("break")
     with self.assertRaisesRegex(ValueError, "Some ranges have exited prematurely"):
       bad_function("return")
     # On exception exit, we let the exception propagate
@@ -288,9 +285,9 @@ class LoopsTest(jtu.JaxTestCase):
     self.assertAllClose(16., f_op(0, 4, 4.), check_dtypes=True)
     # Ok to jit, as long as the start and end are static
     self.assertAllClose(16., api.jit(f_op, static_argnums=(0, 1))(0, 4, 4.), check_dtypes=True)
-    with self.assertRaisesRegex(TypeError, "Abstract value passed to `int`, which requires a concrete value"):
+    with self.assertRaisesRegex(TypeError, "Abstract tracer value encountered where concrete value is expected"):
       self.assertAllClose(16., api.jit(f_op)(0, 4, 4.), check_dtypes=True)
-    with self.assertRaisesRegex(TypeError, "Abstract value passed to `int`, which requires a concrete value"):
+    with self.assertRaisesRegex(TypeError, "Abstract tracer value encountered where concrete value is expected"):
       self.assertAllClose(16., api.vmap(f_op)(np.zeros(10), np.ones(10), np.array([4.] * 10)), check_dtypes=True)
 
   def test_cond(self):
@@ -380,8 +377,9 @@ class LoopsTest(jtu.JaxTestCase):
     self.assertAllClose(f_expected(2.), f_op(2.), check_dtypes=True)
     self.assertAllClose(f_expected(2.), api.jit(f_op)(2.), check_dtypes=True)
     self.assertAllClose(f_expected(1.), f_op(1.), check_dtypes=True)
-    init_batch = np.array([1., 2., 3.])
-    self.assertAllClose(np.array([f_expected(init) for init in init_batch]),
+    init_batch = onp.array([1., 2., 3.], dtype=onp.float32)
+    self.assertAllClose(onp.array([f_expected(init) for init in init_batch],
+                                  dtype=onp.float32),
                         api.vmap(f_op)(init_batch), check_dtypes=True)
 
   def test_error_while_cond_mutation(self):

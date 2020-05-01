@@ -17,13 +17,14 @@
 
 import jaxlib
 
-_minimum_jaxlib_version = (0, 1, 36)
+_minimum_jaxlib_version = (0, 1, 45)
 try:
   from jaxlib import version as jaxlib_version
-except:
+except Exception as err:
   # jaxlib is too old to have version number.
   msg = 'This version of jax requires jaxlib version >= {}.'
-  raise ImportError(msg.format('.'.join(map(str, _minimum_jaxlib_version))))
+  raise ImportError(msg.format('.'.join(map(str, _minimum_jaxlib_version)))
+                    ) from err
 
 version = tuple(int(x) for x in jaxlib_version.__version__.split('.'))
 
@@ -45,7 +46,7 @@ _check_jaxlib_version()
 
 
 try:
-  from jaxlib import tpu_client
+  from jaxlib import tpu_client  # pytype: disable=import-error
 except:
   tpu_client = None
 from jaxlib import xla_client

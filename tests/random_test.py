@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 from functools import partial
 from unittest import SkipTest
@@ -23,20 +20,23 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import numpy as onp
+import scipy.linalg
 import scipy.special
 import scipy.stats
 
 from jax import api
+from jax import core
+from jax import grad
 from jax import lax
 from jax import numpy as np
 from jax import random
 from jax import test_util as jtu
+from jax import vmap
 from jax.interpreters import xla
 
 from jax.config import config
 config.parse_flags_with_absl()
 FLAGS = config.FLAGS
-
 
 class LaxRandomTest(jtu.JaxTestCase):
 
@@ -56,9 +56,19 @@ class LaxRandomTest(jtu.JaxTestCase):
   def _CheckChiSquared(self, samples, pmf):
     alpha = 0.01  # significance level, threshold for p-value
     values, actual_freq = onp.unique(samples, return_counts=True)
-    expected_freq = pmf(values) * len(values)
-    _, p_value = scipy.stats.chisquare(actual_freq, expected_freq)
-    self.assertLess(p_value, alpha)
+    expected_freq = pmf(values) * samples.size
+    # per scipy: "A typical rule is that all of the observed and expected
+    # frequencies should be at least 5."
+    valid = (actual_freq > 5) & (expected_freq > 5)
+    self.assertGreater(valid.sum(), 1,
+                       msg='not enough valid frequencies for chi-squared test')
+    _, p_value = scipy.stats.chisquare(
+        actual_freq[valid], expected_freq[valid])
+    self.assertGreater(
+        p_value, alpha,
+        msg=f'Failed chi-squared test with p={p_value}.\n'
+            'Expected vs. actual frequencies:\n'
+            f'{expected_freq[valid]}\n{actual_freq[valid]}')
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
@@ -165,10 +175,49 @@ class LaxRandomTest(jtu.JaxTestCase):
     perm1 = rand(key)
     perm2 = crand(key)
 
-    self.assertTrue(onp.all(perm1 == perm2))
-    self.assertTrue(onp.all(perm1.dtype == perm2.dtype))
+    self.assertAllClose(perm1, perm2, check_dtypes=True)
     self.assertFalse(onp.all(perm1 == x))  # seems unlikely!
-    self.assertTrue(onp.all(onp.sort(perm1) == x))
+    self.assertAllClose(onp.sort(perm1), x, check_dtypes=False)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
+      for dtype in [onp.float32, onp.float64, onp.int32, onp.int64]))
+  def testPermutationArray(self, dtype):
+    key = random.PRNGKey(0)
+    x = onp.arange(100).astype(dtype)
+    rand = lambda key: random.permutation(key, x)
+    crand = api.jit(rand)
+
+    perm1 = rand(key)
+    perm2 = crand(key)
+
+    self.assertAllClose(perm1, perm2, check_dtypes=True)
+    self.assertEqual(perm1.dtype, perm2.dtype)
+    self.assertFalse(onp.all(perm1 == x))  # seems unlikely!
+    self.assertAllClose(onp.sort(perm1), x, check_dtypes=False)
+    self.assertArraysAllClose(x, onp.arange(100).astype(dtype),
+                              check_dtypes=True)
+
+  def testPermutationInteger(self):
+    key = random.PRNGKey(0)
+    x = 100
+    rand = lambda key: random.permutation(key, x)
+    crand = api.jit(rand)
+
+    perm1 = rand(key)
+    perm2 = crand(key)
+
+    self.assertAllClose(perm1, perm2, check_dtypes=True)
+    self.assertEqual(perm1.dtype, perm2.dtype)
+    self.assertFalse(onp.all(perm1 == onp.arange(100)))  # seems unlikely!
+    self.assertAllClose(onp.sort(perm1), onp.arange(100), check_dtypes=False)
+
+  def testPermutationErrors(self):
+    key = random.PRNGKey(0)
+    with self.assertRaises(TypeError):
+      random.permutation(key, 10.)
+    with self.assertRaises(core.ConcretizationTypeError):
+      api.jit(random.permutation)(key, 10)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_p={}_{}".format(p, dtype),
@@ -187,6 +236,43 @@ class LaxRandomTest(jtu.JaxTestCase):
     for samples in [uncompiled_samples, compiled_samples]:
       self._CheckChiSquared(samples, scipy.stats.bernoulli(p).pmf)
 
+  @parameterized.named_parameters(jtu.cases_from_list(
+    {"testcase_name": "_p={}_{}_{}".format(p, dtype, sample_shape),
+     "p": p, "axis": axis, "dtype": onp.dtype(dtype).name, 'sample_shape': sample_shape}
+    for (p, axis) in [
+        ([.25] * 4, -1),
+        ([.1, .2, .3, .4], -1),
+        ([[.25, .25], [.1, .9]], 1),
+        ([[.25, .1], [.25, .9]], 0),
+    ]
+    for sample_shape in [(10000,), (5000, 2)]
+    for dtype in [onp.float32, onp.float64]))
+  def testCategorical(self, p, axis, dtype, sample_shape):
+    key = random.PRNGKey(0)
+    p = onp.array(p, dtype=dtype)
+    logits = onp.log(p) - 42 # test unnormalized
+    shape = sample_shape + tuple(onp.delete(logits.shape, axis))
+    rand = lambda key, p: random.categorical(key, logits, shape=shape, axis=axis)
+    crand = api.jit(rand)
+
+    uncompiled_samples = rand(key, p)
+    compiled_samples = crand(key, p)
+
+    if p.ndim > 1:
+      self.skipTest("multi-dimensional categorical tests are currently broken!")
+
+    for samples in [uncompiled_samples, compiled_samples]:
+      if axis < 0:
+       axis += len(logits.shape)
+
+      assert samples.shape == shape
+
+      if len(p.shape[:-1]) > 0:
+        for cat_index, p_ in enumerate(p):
+          self._CheckChiSquared(samples[:, cat_index], pmf=lambda x: p_[x])
+      else:
+        self._CheckChiSquared(samples, pmf=lambda x: p[x])
+
   def testBernoulliShape(self):
     key = random.PRNGKey(0)
     x = random.bernoulli(key, onp.array([0.2, 0.3]), shape=(3, 2))
@@ -197,11 +283,10 @@ class LaxRandomTest(jtu.JaxTestCase):
        "a": a, "b": b, "dtype": onp.dtype(dtype).name}
       for a in [0.2, 5.]
       for b in [0.2, 5.]
-      for dtype in [onp.float32, onp.float64]))
-  # TODO(phawkins): slow compilation times on cpu and tpu.
-  # TODO(mattjj): test fails after https://github.com/google/jax/pull/1123
-  @jtu.skip_on_devices("cpu", "gpu", "tpu")
+      for dtype in [onp.float64]))  # NOTE: KS test fails with float32
   def testBeta(self, a, b, dtype):
+    if not FLAGS.jax_enable_x64:
+      raise SkipTest("skip test except on X64")
     key = random.PRNGKey(0)
     rand = lambda key, a, b: random.beta(key, a, b, (10000,), dtype)
     crand = api.jit(rand)
@@ -300,6 +385,15 @@ class LaxRandomTest(jtu.JaxTestCase):
     self.assertAllClose(actual_grad, expected_grad, check_dtypes=True,
                         rtol=2e-2 if jtu.device_under_test() == "tpu" else 5e-4)
 
+  def testGammaGradType(self):
+    # Regression test for https://github.com/google/jax/issues/2130
+    key = random.PRNGKey(0)
+    a = np.array(1., dtype=np.float32)
+    b = np.array(3., dtype=np.float32)
+    f = lambda x, y: random.gamma(key=key, a=x, dtype=np.float32) / y
+    # Should not crash with a type error.
+    api.vjp(f, a, b)
+
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
       for dtype in [onp.float32, onp.float64]))
@@ -385,6 +479,7 @@ class LaxRandomTest(jtu.JaxTestCase):
        "dim": dim, "dtype": dtype}
       for dim in [1, 3, 5]
       for dtype in [onp.float32, onp.float64]))
+  @jtu.skip_on_mac_linalg_bug()
   def testMultivariateNormal(self, dim, dtype):
     r = onp.random.RandomState(dim)
     mean = r.randn(dim)
@@ -409,6 +504,31 @@ class LaxRandomTest(jtu.JaxTestCase):
       # eigenvectors follow a standard normal distribution.
       self._CheckKolmogorovSmirnovCDF(whitened.ravel(), scipy.stats.norm().cdf)
 
+  @jtu.skip_on_mac_linalg_bug()
+  def testMultivariateNormalCovariance(self):
+    # test code based on https://github.com/google/jax/issues/1869
+    N = 100000
+    cov = np.array([[ 0.19,  0.00, -0.13,  0.00],
+                   [  0.00,  0.29,  0.00, -0.23],
+                   [ -0.13,  0.00,  0.39,  0.00],
+                   [  0.00, -0.23,  0.00,  0.49]])
+    mean = np.zeros(4)
+
+    out_onp = onp.random.RandomState(0).multivariate_normal(mean, cov, N)
+
+    key = random.PRNGKey(0)
+    out_jnp = random.multivariate_normal(key, mean=mean, cov=cov, shape=(N,))
+
+    var_onp = out_onp.var(axis=0)
+    var_jnp = out_jnp.var(axis=0)
+    self.assertAllClose(var_onp, var_jnp, rtol=1e-2, atol=1e-2,
+                        check_dtypes=False)
+
+    var_onp = onp.cov(out_onp, rowvar=False)
+    var_jnp = onp.cov(out_jnp, rowvar=False)
+    self.assertAllClose(var_onp, var_jnp, rtol=1e-2, atol=1e-2,
+                        check_dtypes=False)
+
   def testIssue222(self):
     x = random.randint(random.PRNGKey(10003), (), 0, 0)
     assert x == 0
@@ -432,7 +552,7 @@ class LaxRandomTest(jtu.JaxTestCase):
       phi = lambda x, t: np.sqrt(2.0 / d) * np.cos(np.matmul(W, x) + w*t + b)
       return phi
 
-    self.assertRaisesRegex(ValueError, '.*requires a concrete.*',
+    self.assertRaisesRegex(TypeError, 'Shapes must be 1D.*',
                            lambda: feature_map(5, 3))
 
   def testIssue756(self):
@@ -443,6 +563,12 @@ class LaxRandomTest(jtu.JaxTestCase):
     else:
       self.assertEqual(onp.result_type(w), onp.float32)
 
+  def testIssue1789(self):
+    def f(x):
+      return random.gamma(random.PRNGKey(0), x)
+
+    grad(lambda x: np.sum(vmap(f)(x)))(np.ones(2))
+
   def testNoOpByOpUnderHash(self):
     def fail(*args, **kwargs): assert False
     apply_primitive, xla.apply_primitive = xla.apply_primitive, fail
@@ -450,6 +576,39 @@ class LaxRandomTest(jtu.JaxTestCase):
       out = random.threefry_2x32(onp.zeros(2, onp.uint32), onp.arange(10, dtype=onp.uint32))
     finally:
       xla.apply_primitive = apply_primitive
+
+  def testPRNGValues(self):
+    # Test to ensure consistent random values between JAX versions
+    k = random.PRNGKey(0)
+
+    randints = random.randint(k, (3, 3), 0, 8)
+    if FLAGS.jax_enable_x64:
+        self.assertAllClose(
+            random.randint(k, (3, 3), 0, 8),
+            onp.array([[7, 2, 6],
+                       [2, 1, 0],
+                       [6, 7, 7]], dtype='int64'),
+            check_dtypes=True)
+    else:
+        self.assertAllClose(
+            random.randint(k, (3, 3), 0, 8),
+            onp.array([[2, 1, 3],
+                       [6, 1, 5],
+                       [6, 3, 4]], dtype='int32'),
+            check_dtypes=True)
+
+    self.assertAllClose(
+        random.split(k, 4),
+        onp.array([[2285895361, 1501764800],
+                   [1518642379, 4090693311],
+                   [ 433833334, 4221794875],
+                   [ 839183663, 3740430601]], dtype='uint32'),
+        check_dtypes=True)
+
+    self.assertAllClose(
+        random.fold_in(k, 4),
+        onp.array([2285895361,  433833334], dtype='uint32'),
+        check_dtypes=True)
 
 
 if __name__ == "__main__":

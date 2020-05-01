@@ -13,9 +13,6 @@
 # limitations under the License.
 
 """Tests for the optimizers module."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import functools
 
@@ -151,6 +148,13 @@ class OptimizerTests(jtu.JaxTestCase):
     step_size = 0.1
     x0 = (np.ones(2), np.ones((2, 2)))
     self._CheckOptimizer(optimizers.sm3, loss, x0, num_iters, step_size)
+
+  def testAdaMaxVector(self):
+    def loss(x): return np.dot(x, x)
+    x0 = np.ones(2)
+    num_iters = 100
+    step_size = 0.1
+    self._CheckOptimizer(optimizers.adamax, loss, x0, num_iters, step_size)
 
   def testSgdVectorExponentialDecaySchedule(self):
     def loss(x): return np.dot(x, x)

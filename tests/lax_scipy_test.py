@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import collections
 import functools
@@ -30,6 +27,7 @@ import scipy.special as osp_special
 import scipy.stats as osp_stats
 
 from jax import api
+from jax import lib
 from jax import test_util as jtu
 from jax.scipy import special as lsp_special
 from jax.scipy import stats as lsp_stats
@@ -60,20 +58,25 @@ def op_record(name, nargs, dtypes, rng_factory, test_grad, test_name=None):
 JAX_SPECIAL_FUNCTION_RECORDS = [
     # TODO: digamma has no JVP implemented.
     op_record("betaln", 2, float_dtypes, jtu.rand_positive, False),
+    op_record("betainc", 3, float_dtypes, jtu.rand_positive, False),
     op_record("digamma", 1, float_dtypes, jtu.rand_positive, False),
+    op_record("gammainc", 2, float_dtypes, jtu.rand_positive, False),
+    op_record("gammaincc", 2, float_dtypes, jtu.rand_positive, False),
     op_record("erf", 1, float_dtypes, jtu.rand_small_positive, True),
     op_record("erfc", 1, float_dtypes, jtu.rand_small_positive, True),
     op_record("erfinv", 1, float_dtypes, jtu.rand_small_positive, True),
     op_record("expit", 1, float_dtypes, jtu.rand_small_positive, True),
     # TODO: gammaln has slightly high error.
     op_record("gammaln", 1, float_dtypes, jtu.rand_positive, False),
-    op_record("logit", 1, float_dtypes, jtu.rand_small_positive, False),
+    op_record("logit", 1, float_dtypes, jtu.rand_uniform, True),
     op_record("log_ndtr", 1, float_dtypes, jtu.rand_default, True),
     op_record("ndtri", 1, float_dtypes, partial(jtu.rand_uniform, 0.05, 0.95),
               True),
     op_record("ndtr", 1, float_dtypes, jtu.rand_default, True),
     # TODO(phawkins): gradient of entr yields NaNs.
     op_record("entr", 1, float_dtypes, jtu.rand_default, False),
+    op_record("xlogy", 2, float_dtypes, jtu.rand_default, True),
+    op_record("xlog1py", 2, float_dtypes, jtu.rand_default, True),
 ]
 
 CombosWithReplacement = itertools.combinations_with_replacement
@@ -132,7 +135,8 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     self._CompileAndCheck(lax_op, args_maker, check_dtypes=True, rtol=1e-5)
 
     if test_autodiff:
-      jtu.check_grads(lax_op, args, order=1, atol=1e-3, rtol=3e-3, eps=1e-3)
+      jtu.check_grads(lax_op, args, order=1,
+                      atol=jtu.if_device_under_test("tpu", 2e-3, 1e-3), rtol=3e-3, eps=1e-3)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_inshape={}_d={}".format(
@@ -159,6 +163,20 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     x = onp.full((4,), -1e20, dtype=onp.float32)
     self.assertAllClose(onp.zeros((4,), dtype=onp.float32),
                         lsp_special.expit(x), check_dtypes=True)
+
+  def testXlogyShouldReturnZero(self):
+    self.assertAllClose(lsp_special.xlogy(0., 0.), 0., check_dtypes=False)
+
+  def testGradOfXlogyAtZero(self):
+    partial_xlogy = functools.partial(lsp_special.xlogy, 0.)
+    self.assertAllClose(api.grad(partial_xlogy)(0.), 0., check_dtypes=False)
+
+  def testXlog1pyShouldReturnZero(self):
+    self.assertAllClose(lsp_special.xlog1py(0., -1.), 0., check_dtypes=False)
+
+  def testGradOfXlog1pyAtZero(self):
+    partial_xlog1py = functools.partial(lsp_special.xlog1py, 0.)
+    self.assertAllClose(api.grad(partial_xlog1py)(-1.), 0., check_dtypes=False)
 
 
 if __name__ == "__main__":
